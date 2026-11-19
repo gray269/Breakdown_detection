@@ -271,15 +271,35 @@ def scan_folders(config: dict) -> list[dict]:
         if not root.is_dir():
             continue
         try:
-            candidates = root.rglob("*")
-            for file_path in candidates:
-                if not file_path.is_file() or file_path.suffix.casefold() not in IMAGE_EXTENSIONS:
-                    continue
-                if pattern and pattern not in file_path.stem.casefold():
-                    continue
-                relative = file_path.parent.relative_to(root).as_posix() or "."
-                entry = groups.setdefault(relative, {"gray": [], "green": []})
-                entry[kind].append(file_path)
+            product_folders = sorted(
+                (item for item in root.iterdir() if item.is_dir()),
+                key=lambda item: item.name.casefold(),
+            )
+            if product_folders:
+                for product_folder in product_folders:
+                    product_name = product_folder.name.strip()
+                    if not product_name:
+                        continue
+                    product_key = product_name.casefold()
+                    entry = groups.setdefault(product_key, {
+                        "product_name": product_name, "gray": [], "green": [],
+                    })
+                    for file_path in product_folder.rglob("*"):
+                        if not file_path.is_file() or file_path.suffix.casefold() not in IMAGE_EXTENSIONS:
+                            continue
+                        if pattern and pattern not in file_path.stem.casefold():
+                            continue
+                        entry[kind].append(file_path)
+            else:
+                # Also accept a root containing images directly, although product
+                # subfolders are the expected structure.
+                entry = groups.setdefault(".", {
+                    "product_name": "Dossier racine", "gray": [], "green": [],
+                })
+                for file_path in root.iterdir():
+                    if file_path.is_file() and file_path.suffix.casefold() in IMAGE_EXTENSIONS:
+                        if not pattern or pattern in file_path.stem.casefold():
+                            entry[kind].append(file_path)
         except OSError:
             continue
 
@@ -289,7 +309,7 @@ def scan_folders(config: dict) -> list[dict]:
     for group_key in sorted(groups, key=str.casefold):
         group = groups[group_key]
         states = {"gray": None, "green": None}
-        image_paths: list[str] = []
+        image_paths = {"gray": [], "green": []}
         errors: list[str] = []
         for kind in ("gray", "green"):
             paths = sorted(group[kind], key=lambda p: str(p).casefold())
@@ -298,7 +318,7 @@ def scan_folders(config: dict) -> list[dict]:
             detected_any = False
             valid_count = 0
             for image_path in paths:
-                image_paths.append(str(image_path))
+                image_paths[kind].append(str(image_path))
                 try:
                     stat = image_path.stat()
                     cache_key = (
@@ -320,15 +340,31 @@ def scan_folders(config: dict) -> list[dict]:
                         detected_any = detected_any or cached[0]
                 except Exception as exc:
                     errors.append(f"{image_path.name}: {exc}")
-            states[kind] = bool(detected_any) if valid_count else None
-        is_defect = any(value is True for value in states.values())
+            if detected_any:
+                states[kind] = True
+            elif valid_count == len(paths):
+                states[kind] = False
+            else:
+                states[kind] = None
+
+        comparable = states["gray"] is not None and states["green"] is not None
+        if not comparable:
+            category = "À vérifier"
+        elif states["gray"] and states["green"]:
+            category = "Présent dans les deux"
+        elif states["gray"]:
+            category = "Dossier 1 uniquement"
+        elif states["green"]:
+            category = "Dossier 2 uniquement"
+        else:
+            category = "Aucun claquage"
         results.append({
             "group_key": group_key,
-            "display_name": "Dossier racine" if group_key == "." else group_key,
+            "display_name": group["product_name"],
             "gray_state": states["gray"],
             "green_state": states["green"],
-            "is_defect": is_defect,
-            "valid": any(value is not None for value in states.values()),
+            "category": category,
+            "comparable": comparable,
             "image_paths": image_paths,
             "errors": errors,
         })
@@ -341,49 +377,61 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
     scanned_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DATABASE_FILE) as connection:
         connection.execute("""
-            CREATE TABLE IF NOT EXISTS results (
+            CREATE TABLE IF NOT EXISTS comparisons (
                 analysis_date TEXT NOT NULL,
                 size TEXT NOT NULL,
-                group_key TEXT NOT NULL,
+                product_key TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 gray_state TEXT NOT NULL,
                 green_state TEXT NOT NULL,
-                is_defect INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                comparable INTEGER NOT NULL,
                 image_paths TEXT NOT NULL,
                 error_text TEXT NOT NULL,
                 scanned_at TEXT NOT NULL,
-                PRIMARY KEY (analysis_date, size, group_key)
+                PRIMARY KEY (analysis_date, size, product_key)
             )
         """)
         connection.execute(
-            "DELETE FROM results WHERE analysis_date=? AND size=?",
+            "DELETE FROM comparisons WHERE analysis_date=? AND size=?",
             (analysis_date, size),
         )
         for row in results:
             gray_state = "oui" if row["gray_state"] is True else "non" if row["gray_state"] is False else "—"
             green_state = "oui" if row["green_state"] is True else "non" if row["green_state"] is False else "—"
             connection.execute("""
-                INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 analysis_date, size, row["group_key"], row["display_name"],
-                gray_state, green_state, int(row["is_defect"]) if row["valid"] else -1,
+                gray_state, green_state, row["category"], int(row["comparable"]),
                 json.dumps(row["image_paths"], ensure_ascii=False),
                 " | ".join(row["errors"]), scanned_at,
             ))
-    total = sum(1 for item in results if item["valid"])
-    defects = sum(1 for item in results if item["valid"] and item["is_defect"])
-    return total, defects
+    total = sum(1 for item in results if item["comparable"])
+    with_defect = sum(1 for item in results if item["category"] != "Aucun claquage" and item["comparable"])
+    return total, with_defect
 
 
 def read_current_results(analysis_date: str, size: str) -> list[tuple]:
     if not DATABASE_FILE.exists():
         return []
-    with sqlite3.connect(DATABASE_FILE) as connection:
-        return connection.execute("""
-            SELECT display_name, gray_state, green_state, is_defect, error_text
-            FROM results WHERE analysis_date=? AND size=?
-            ORDER BY is_defect DESC, display_name COLLATE NOCASE
-        """, (analysis_date, size)).fetchall()
+    try:
+        with sqlite3.connect(DATABASE_FILE) as connection:
+            return connection.execute("""
+                SELECT display_name, gray_state, green_state, category, comparable, error_text
+                FROM comparisons WHERE analysis_date=? AND size=?
+                ORDER BY CASE category
+                    WHEN 'Dossier 1 uniquement' THEN 1
+                    WHEN 'Présent dans les deux' THEN 2
+                    WHEN 'Dossier 2 uniquement' THEN 3
+                    WHEN 'Aucun claquage' THEN 4
+                    ELSE 5 END,
+                    display_name COLLATE NOCASE
+            """, (analysis_date, size)).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).casefold():
+            return []
+        raise
 
 
 class ImageTestWindow:
@@ -468,14 +516,14 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Choisissez les dossiers d’images. Le logiciel cherche les fichiers dont le nom contient le motif indiqué.",
+            text="Chaque sous-dossier de premier niveau correspond à un numéro produit. Le logiciel compare le même numéro dans les deux dossiers et cherche les fichiers dont le nom contient le motif indiqué.",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
         folders = ttk.LabelFrame(body, text="Dossiers à surveiller", padding=10)
         folders.pack(fill="x", pady=5)
-        self._folder_row(folders, "Images en niveaux de gris", self.folder_gray, 0)
-        self._folder_row(folders, "Images vertes", self.folder_green, 1)
+        self._folder_row(folders, "Dossier 1 — images grises", self.folder_gray, 0)
+        self._folder_row(folders, "Dossier 2 — images vertes", self.folder_green, 1)
 
         metadata = ttk.LabelFrame(body, text="Données du contrôle", padding=10)
         metadata.pack(fill="x", pady=5)
@@ -503,7 +551,7 @@ class SettingsWindow:
 
         note = ttk.Label(
             body,
-            text="Mode essai : sélectionnez des images pour voir le résultat et la zone détectée. Le rapport conserve la date, la taille et le nom des dossiers analysés.",
+            text="Pour calculer le taux « dossier 2 uniquement », les images vertes sont aussi analysées pour les numéros sans claquage gris. Un produit n’entre dans les taux que si les deux images ont pu être analysées. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
             wraplength=730,
         )
         note.pack(anchor="w", pady=10)
@@ -590,7 +638,13 @@ class MonitorApp:
         self.settings_window: SettingsWindow | None = None
         self.scan_running = False
         self.next_scan_id: str | None = None
-        self.rate_var = StringVar(value="— %")
+        self.category_names = (
+            "Dossier 1 uniquement",
+            "Présent dans les deux",
+            "Dossier 2 uniquement",
+        )
+        self.rate_vars = {name: StringVar(value="— %") for name in self.category_names}
+        self.rate_count_vars = {name: StringVar(value="0 / 0 produit") for name in self.category_names}
         self.count_var = StringVar(value="En attente des paramètres")
         self.status_var = StringVar(value="Surveillance arrêtée")
         self.filter_var = StringVar(value="")
@@ -601,8 +655,8 @@ class MonitorApp:
 
     def _build_main_window(self) -> None:
         self.root.title("Suivi du claquage")
-        self.root.geometry("360x310")
-        self.root.minsize(340, 280)
+        self.root.geometry("520x475")
+        self.root.minsize(490, 430)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -610,20 +664,36 @@ class MonitorApp:
         frame.pack(fill="both", expand=True)
         header = ttk.Frame(frame)
         header.pack(fill="x")
-        ttk.Label(header, text="TAUX DE CLAQUAGE", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(frame, textvariable=self.rate_var, font=("Segoe UI", 30, "bold"), foreground="#b42318").pack(pady=(3, 0))
+        ttk.Label(header, text="COMPARAISON DES CLAQUAGES PAR NUMÉRO PRODUIT", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        cards = ttk.Frame(frame)
+        cards.pack(fill="x", pady=(8, 4))
+        rate_labels = (
+            ("Dossier 1 seul", self.category_names[0]),
+            ("Dossier 1 + 2", self.category_names[1]),
+            ("Dossier 2 seul", self.category_names[2]),
+        )
+        for column, (title, category) in enumerate(rate_labels):
+            card = ttk.LabelFrame(cards, text=title, padding=(7, 4))
+            card.grid(row=0, column=column, sticky="nsew", padx=3)
+            cards.columnconfigure(column, weight=1)
+            ttk.Label(card, textvariable=self.rate_vars[category], font=("Segoe UI", 18, "bold"), foreground="#b42318").pack()
+            ttk.Label(card, textvariable=self.rate_count_vars[category], font=("Segoe UI", 8)).pack()
+
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 10)).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))
         ttk.Label(frame, textvariable=self.status_var, foreground="#555555").pack(pady=(0, 4))
 
-        columns = ("dossier", "gris", "vert")
-        self.table = ttk.Treeview(frame, columns=columns, show="headings", height=5)
-        self.table.heading("dossier", text="Dossier")
+        columns = ("produit", "gris", "vert", "categorie")
+        self.table = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        self.table.heading("produit", text="Numéro produit")
         self.table.heading("gris", text="Gris")
         self.table.heading("vert", text="Vert")
-        self.table.column("dossier", width=180, anchor="w")
+        self.table.heading("categorie", text="Résultat")
+        self.table.column("produit", width=140, anchor="w")
         self.table.column("gris", width=50, anchor="center")
         self.table.column("vert", width=50, anchor="center")
+        self.table.column("categorie", width=190, anchor="w")
         self.table.pack(fill="both", expand=True, pady=(3, 8))
 
         buttons = ttk.Frame(frame)
@@ -687,7 +757,7 @@ class MonitorApp:
         if not results:
             self.status_var.set("Aucune image correspondant au motif")
         elif total == 0:
-            self.status_var.set("Images trouvées, mais aucune analyse valide")
+            self.status_var.set("Aucune paire grise/verte analysable pour les mêmes produits")
         else:
             self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
 
@@ -695,23 +765,40 @@ class MonitorApp:
         analysis_date = str(self.config.get("analysis_date", date.today().isoformat()))
         size = str(self.config.get("size", "16 mm"))
         rows = read_current_results(analysis_date, size)
-        total = sum(1 for row in rows if row[3] in (0, 1))
-        defects = sum(1 for row in rows if row[3] == 1)
+        comparable_rows = [row for row in rows if row[4]]
+        total = len(comparable_rows)
+        category_counts = {
+            category: sum(1 for row in comparable_rows if row[3] == category)
+            for category in self.category_names
+        }
+        defects = sum(category_counts.values())
         if total:
-            self.rate_var.set(f"{100.0 * defects / total:.1f} %")
-            self.count_var.set(f"{defects} dossier(s) avec claquage / {total} analysé(s)")
+            for category in self.category_names:
+                count = category_counts[category]
+                self.rate_vars[category].set(f"{100.0 * count / total:.1f} %")
+                self.rate_count_vars[category].set(f"{count} / {total} produit(s)")
+            self.count_var.set(f"{defects} produit(s) avec claquage · {total} paire(s) comparable(s)")
         else:
-            self.rate_var.set("— %")
-            self.count_var.set("Aucun dossier analysé pour ces paramètres")
+            for category in self.category_names:
+                self.rate_vars[category].set("— %")
+                self.rate_count_vars[category].set("0 / 0 produit")
+            self.count_var.set("Aucun produit analysable dans les deux dossiers")
         self.filter_var.set(f"{analysis_date} · {size}")
         for item in self.table.get_children():
             self.table.delete(item)
-        for display_name, gray_state, green_state, is_defect, error_text in rows[:200]:
-            label = f"⚠ {display_name}" if is_defect == 1 else f"? {display_name}" if is_defect == -1 else display_name
-            tag = "bad" if is_defect == 1 else "unknown" if is_defect == -1 else ""
-            self.table.insert("", "end", values=(label, gray_state, green_state), tags=(tag,) if tag else ())
-        self.table.tag_configure("bad", foreground="#b42318")
-        self.table.tag_configure("unknown", foreground="#9a6700")
+        tags = {
+            "Dossier 1 uniquement": "gray_only",
+            "Présent dans les deux": "both",
+            "Dossier 2 uniquement": "green_only",
+            "À vérifier": "unknown",
+        }
+        for display_name, gray_state, green_state, category, comparable, error_text in rows[:500]:
+            tag = tags.get(category, "")
+            self.table.insert("", "end", values=(display_name, gray_state, green_state, category), tags=(tag,) if tag else ())
+        self.table.tag_configure("gray_only", foreground="#9a6700")
+        self.table.tag_configure("both", foreground="#b42318")
+        self.table.tag_configure("green_only", foreground="#0969da")
+        self.table.tag_configure("unknown", foreground="#6e7781")
 
     def schedule_next_scan(self, delay_seconds: int | None = None) -> None:
         if self.next_scan_id is not None:
@@ -745,13 +832,12 @@ class MonitorApp:
             with sqlite3.connect(DATABASE_FILE) as connection:
                 rows = connection.execute("""
                     SELECT analysis_date, size, display_name, gray_state, green_state,
-                           CASE is_defect WHEN 1 THEN 'Oui' WHEN 0 THEN 'Non' ELSE 'À vérifier' END,
-                           image_paths, error_text, scanned_at
-                    FROM results ORDER BY analysis_date DESC, size, display_name COLLATE NOCASE
+                           category, comparable, image_paths, error_text, scanned_at
+                    FROM comparisons ORDER BY analysis_date DESC, size, display_name COLLATE NOCASE
                 """).fetchall()
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
-                writer.writerow(("Date", "Taille", "Dossier", "Image grise", "Image verte", "Claquage", "Chemins des images", "Erreur", "Dernière analyse"))
+                writer.writerow(("Date", "Taille", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
                 writer.writerows(rows)
             self.status_var.set("Rapport CSV exporté")
         except Exception as exc:

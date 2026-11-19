@@ -18,6 +18,18 @@ Dans **Actions**, ouvre la dernière exécution terminée du workflow **Construi
 
 L’artefact est conservé 30 jours. Après expiration, relance **Run workflow** pour en générer un nouveau.
 
+## Comparaison des deux dossiers
+
+Le nom du sous-dossier de premier niveau est le numéro produit. Le logiciel associe les produits entre les dossiers 1 et 2 à partir de ce nom, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit.
+
+Pour calculer le taux « dossier 2 uniquement », le logiciel doit aussi analyser les images vertes des produits qui n’ont pas été détectés en gris. Les trois taux affichés utilisent le même dénominateur : le nombre de produits ayant une image analysable dans chacun des deux dossiers.
+
+- **T1 — Dossier 1 uniquement** : claquage détecté en gris, absent en vert.
+- **T2 — Présent dans les deux** : claquage détecté en gris et en vert.
+- **T3 — Dossier 2 uniquement** : claquage absent en gris, détecté en vert.
+
+Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa catégorie. Les produits sans claquage dans les deux images sont inclus au dénominateur, mais ne font partie d’aucun des trois taux. Les images manquantes ou impossibles à analyser sont marquées « À vérifier » et exclues du dénominateur.
+
 ## Fonctions de l’application
 
 - Petite fenêtre avec le taux de claquage, le nombre de dossiers analysés et leur résultat.
@@ -32,6 +44,6 @@ Les résultats sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`.
 
 ## Règle de calcul
 
-Le taux affiché est le nombre de dossiers analysables avec au moins un point détecté, divisé par le nombre total de dossiers analysables pour la date et la taille sélectionnées. Si les deux dossiers surveillés ont la même arborescence relative, les images grises et vertes d’un même sous-dossier sont regroupées. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur.
+Les taux sont calculés sur les produits comparables pour la date et la taille sélectionnées. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.
