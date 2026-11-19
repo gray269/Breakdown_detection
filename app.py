@@ -155,11 +155,11 @@ def analyze_image(
     with Image.open(path) as source:
         original_size = source.size
         original = source.convert("RGB") if annotate else None
-        # Avoid copying a full-resolution TIFF/JPEG before reducing it for the
-        # scan. The original is retained only for the interactive test window.
-        work = source
-    work.thumbnail((max_side, max_side), Image.Resampling.BOX)
-    work = work.convert("RGB")
+        # Resize while the file is still open, then detach the reduced pixels.
+        # The batch scan uses annotate=False; accessing a lazy Pillow image
+        # after leaving this context caused every TIFF to fail in batch mode.
+        source.thumbnail((max_side, max_side), Image.Resampling.BOX)
+        work = source.convert("RGB")
     rgb = np.asarray(work, dtype=np.uint8)
 
     red = rgb[:, :, 0].astype(np.float32)
@@ -334,6 +334,19 @@ def _canonical_product_name(folder_name: str) -> str:
 def _exception_description(exc: Exception) -> str:
     """Include exception type and arguments, even when str(exc) is empty."""
     return f"{type(exc).__name__}: {exc!r}"
+
+
+def _classify_states(gray_state: bool | None, green_state: bool | None) -> str:
+    """Classify positive detections, including products with only one usable image."""
+    if gray_state is True and green_state is True:
+        return "Présent dans les deux"
+    if gray_state is True:
+        return "Dossier 1 uniquement"
+    if green_state is True:
+        return "Dossier 2 uniquement"
+    if gray_state is False and green_state is False:
+        return "Aucun claquage"
+    return "À vérifier"
 
 
 def _folder_created_date(folder: Path) -> date | None:
@@ -598,16 +611,7 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
         group = groups[key]
         gray_state, green_state = states[key]["gray"], states[key]["green"]
         comparable = gray_state is not None and green_state is not None
-        if not comparable:
-            category = "À vérifier"
-        elif gray_state and green_state:
-            category = "Présent dans les deux"
-        elif gray_state:
-            category = "Dossier 1 uniquement"
-        elif green_state:
-            category = "Dossier 2 uniquement"
-        else:
-            category = "Aucun claquage"
+        category = _classify_states(gray_state, green_state)
         results.append({
             "group_key": key,
             "display_name": group["product_name"],
@@ -662,9 +666,15 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
                 json.dumps(row["image_paths"], ensure_ascii=False),
                 " | ".join(row["errors"]), scanned_at,
             ))
-    total = sum(1 for item in results if item["comparable"])
-    with_defect = sum(1 for item in results if item["category"] != "Aucun claquage" and item["comparable"])
-    return total, with_defect
+    analyzed_products = sum(
+        1 for item in results
+        if item["gray_state"] is not None or item["green_state"] is not None
+    )
+    with_defect = sum(
+        1 for item in results
+        if item["category"] in {"Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement"}
+    )
+    return analyzed_products, with_defect
 
 
 def read_current_results(start_date: str, end_date: str) -> list[tuple]:
@@ -1103,24 +1113,40 @@ class MonitorApp:
         elif total == 0:
             gray_products = sum(bool(row["image_paths"]["gray"]) for row in results)
             green_products = sum(bool(row["image_paths"]["green"]) for row in results)
-            error_count = sum(len(row["errors"]) for row in results)
-            self.progress_text_var.set(f"Terminé · 0 paire comparable · gris {gray_products} / vert {green_products}")
+            errors = [error for row in results for error in row["errors"]]
+            self.progress_text_var.set(f"Terminé · 0 produit analysable · gris {gray_products} / vert {green_products}")
+            error_count = len(errors)
             if error_count:
-                self.status_var.set(f"{error_count} erreur(s) d’image · consultez le CSV pour le détail")
+                first_error = errors[0][:110]
+                self.status_var.set(f"{error_count} erreur(s) · exemple : {first_error} · détail dans le CSV")
             else:
                 self.status_var.set("Vérifier la période, les numéros produit et les images picture_2")
         else:
-            self.progress_text_var.set(f"Analyse terminée · {sum(len(row['image_paths']['gray']) + len(row['image_paths']['green']) for row in results)} images")
-            self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
+            pair_count = sum(1 for row in results if row["comparable"])
+            error_count = sum(len(row["errors"]) for row in results)
+            self.progress_text_var.set(f"Terminé · {total} produit(s) analysé(s) · {pair_count} paire(s) complète(s)")
+            if error_count:
+                self.status_var.set(f"Mis à jour avec {error_count} erreur(s) d’image · détail dans le CSV")
+            else:
+                self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
 
     def refresh_summary(self) -> None:
         start_date = str(self.config.get("analysis_start_date", date.today().isoformat()))
         end_date = str(self.config.get("analysis_end_date", start_date))
         rows = read_current_results(start_date, end_date)
-        comparable_rows = [row for row in rows if row[4]]
-        total = len(comparable_rows)
+        classified_rows = []
+        for row in rows:
+            gray_value = {"oui": True, "non": False}.get(row[1])
+            green_value = {"oui": True, "non": False}.get(row[2])
+            classified_rows.append((row, _classify_states(gray_value, green_value)))
+        analyzed_rows = [
+            row for row, _category in classified_rows
+            if row[1] != "—" or row[2] != "—"
+        ]
+        total = len(analyzed_rows)
+        pair_count = sum(1 for row in analyzed_rows if row[4])
         category_counts = {
-            category: sum(1 for row in comparable_rows if row[3] == category)
+            category: sum(1 for row, classified in classified_rows if classified == category)
             for category in self.category_names
         }
         defects = sum(category_counts.values())
@@ -1129,12 +1155,14 @@ class MonitorApp:
                 count = category_counts[category]
                 self.rate_vars[category].set(f"{100.0 * count / total:.1f} %")
                 self.rate_count_vars[category].set(f"{count} / {total} produit(s)")
-            self.count_var.set(f"{defects} produit(s) avec claquage · {total} paire(s) comparable(s)")
+            self.count_var.set(
+                f"{defects} produit(s) avec claquage · {total} analysé(s) · {pair_count} paire(s) complète(s)"
+            )
         else:
             for category in self.category_names:
                 self.rate_vars[category].set("— %")
                 self.rate_count_vars[category].set("0 / 0 produit")
-            self.count_var.set("Aucun produit analysable dans les deux dossiers")
+            self.count_var.set("Aucun produit analysable")
         self.filter_var.set(f"{start_date} → {end_date} · toutes tailles de module")
         for item in self.table.get_children():
             self.table.delete(item)
@@ -1144,7 +1172,8 @@ class MonitorApp:
             "Dossier 2 uniquement": "green_only",
             "À vérifier": "unknown",
         }
-        for display_name, gray_state, green_state, category, comparable, error_text in rows[:500]:
+        for row, category in classified_rows[:500]:
+            display_name, gray_state, green_state, _stored_category, comparable, error_text = row
             tag = tags.get(category, "")
             self.table.insert("", "end", values=(display_name, gray_state, green_state, category), tags=(tag,) if tag else ())
         self.table.tag_configure("gray_only", foreground="#9a6700")

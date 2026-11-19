@@ -22,13 +22,13 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 Dans le dossier 1, les sous-dossiers portent les numéros produit. Dans le dossier 2, les sous-dossiers portent les dates (par exemple `20261118`), puis les numéros produit ; le dossier 2 peut aussi être choisi directement sur une date. La période filtre la date de création Windows des dossiers gris et, pour le vert, la date inscrite dans le nom du dossier date. Si le vert ne contient pas de dossier date identifiable, le programme utilise la date de création du dossier produit. Les dossiers gris nommés avec un horodatage après le numéro produit (par exemple `26270014_20261118114306`) sont rattachés au numéro de base `26270014`. Dans chaque dossier produit, un seul fichier image nommé exactement `picture_2` est retenu. Les modules 16 mm et 18 mm sont regroupés.
 
-Le dossier gris est analysé en premier. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai, afin que le scan ne manque pas un point visible pendant un essai. Pour calculer le taux « dossier 2 uniquement », les images vertes des produits sans défaut gris sont aussi analysées. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les trois taux utilisent le même dénominateur : les produits ayant une image `picture_2` exploitable dans chacun des deux dossiers pour l’intervalle choisi.
+Le dossier gris est analysé en premier. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai, afin que le scan ne manque pas un point visible pendant un essai. Pour calculer le taux « dossier 2 uniquement », les images vertes des produits sans défaut gris sont aussi analysées. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les trois taux utilisent le même dénominateur : les numéros produit ayant au moins une image `picture_2` correctement analysée dans l’intervalle choisi. Le nombre de paires complètes est affiché séparément.
 
 - **T1 — Dossier 1 uniquement** : claquage détecté en gris, absent en vert.
 - **T2 — Présent dans les deux** : claquage détecté en gris et en vert.
 - **T3 — Dossier 2 uniquement** : claquage absent en gris, détecté en vert.
 
-Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa catégorie. Les produits sans claquage dans les deux images sont inclus au dénominateur, mais ne font partie d’aucun des trois taux. Les images manquantes ou impossibles à analyser sont marquées « À vérifier » et exclues du dénominateur.
+Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa catégorie. Les produits sans claquage dans les images analysées sont inclus au dénominateur, mais ne font partie d’aucun des trois taux. Si un seul côté est exploitable, il compte dans le dénominateur ; une détection de ce côté est attribuée au dossier correspondant. Les erreurs restent visibles dans le CSV.
 
 ## Fonctions de l’application
 
@@ -48,6 +48,6 @@ Les résultats sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`.
 
 ## Règle de calcul
 
-Les taux sont calculés sur les produits ayant une image exploitable dans chacun des deux dossiers pour la période sélectionnée, toutes tailles de module confondues. Les dates des images grises viennent de la création du dossier produit ; les dates vertes viennent du dossier date `AAAAMMJJ`. Les produits sans image dans l’un des deux dossiers ou avec une erreur de lecture sont « à vérifier » et exclus du dénominateur. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
+Les taux ont pour dénominateur les numéros produit ayant au moins une image correctement analysée dans la période, toutes tailles de module confondues. Une paire complète reste indiquée séparément. Si un claquage est détecté dans une seule source exploitable, il est compté dans le taux de cette source même si l’autre image manque ou ne peut pas être lue. Les erreurs sont signalées et visibles dans le CSV. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.
