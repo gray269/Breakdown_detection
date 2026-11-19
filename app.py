@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import queue
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 APP_NAME = "SuiviClaquage"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
-MAX_ANALYSIS_SIDE = 800
+MAX_ANALYSIS_SIDE = 640
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
@@ -42,7 +43,6 @@ DEFAULT_CONFIG = {
     "folder_green": "",
     "filename_pattern": "picture_2",
     "analysis_date": date.today().isoformat(),
-    "size": "16 mm",
     "interval_seconds": 30,
     "min_spot_diameter_percent": 1.8,
     "contrast_ratio": 0.20,
@@ -56,6 +56,7 @@ def load_config() -> dict:
         saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(saved, dict):
             config.update(saved)
+            config.pop("size", None)
     except (OSError, json.JSONDecodeError):
         pass
     return config
@@ -68,56 +69,88 @@ def write_config(config: dict) -> None:
 
 
 def _connected_components(binary: np.ndarray) -> list[dict]:
-    """Return 8-connected dark regions from a modest, downsampled mask."""
-    height, width = binary.shape
-    active = np.flatnonzero(binary)
-    if active.size == 0:
-        return []
+    """Find 8-connected regions by joining horizontal runs instead of pixels."""
+    height, _width = binary.shape
+    parents: list[int] = []
+    ranks: list[int] = []
+    runs: list[tuple[int, int, int, int]] = []
+    previous: list[tuple[int, int, int]] = []
 
-    visited = np.zeros(binary.size, dtype=np.uint8)
-    flat = binary.ravel()
-    found: list[dict] = []
-    for seed_value in active:
-        seed = int(seed_value)
-        if visited[seed]:
-            continue
-        visited[seed] = 1
-        stack = [seed]
-        xs: list[int] = []
-        ys: list[int] = []
-        while stack:
-            index = stack.pop()
-            y, x = divmod(index, width)
-            xs.append(x)
-            ys.append(y)
-            for ny in range(max(0, y - 1), min(height, y + 2)):
-                row = ny * width
-                for nx in range(max(0, x - 1), min(width, x + 2)):
-                    neighbor = row + nx
-                    if not visited[neighbor] and flat[neighbor]:
-                        visited[neighbor] = 1
-                        stack.append(neighbor)
+    def find(value: int) -> int:
+        while parents[value] != value:
+            parents[value] = parents[parents[value]]
+            value = parents[value]
+        return value
 
-        found.append({
-            "area": len(xs),
-            "x": float(np.mean(xs)),
-            "y": float(np.mean(ys)),
-            "left": int(min(xs)),
-            "top": int(min(ys)),
-            "right": int(max(xs)),
-            "bottom": int(max(ys)),
-            "x_values": xs,
-            "y_values": ys,
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        if ranks[left_root] < ranks[right_root]:
+            left_root, right_root = right_root, left_root
+        parents[right_root] = left_root
+        if ranks[left_root] == ranks[right_root]:
+            ranks[left_root] += 1
+
+    for y in range(height):
+        row = binary[y].astype(np.int8, copy=False)
+        changes = np.diff(np.pad(row, (1, 1)))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+        current: list[tuple[int, int, int]] = []
+        previous_index = 0
+        for start_value, end_value in zip(starts, ends):
+            start, end = int(start_value), int(end_value)
+            label = len(parents)
+            parents.append(label)
+            ranks.append(0)
+            runs.append((y, start, end, label))
+            while previous_index < len(previous) and previous[previous_index][1] < start - 1:
+                previous_index += 1
+            scan_index = previous_index
+            while scan_index < len(previous) and previous[scan_index][0] <= end + 1:
+                union(label, previous[scan_index][2])
+                scan_index += 1
+            current.append((start, end, label))
+        previous = current
+
+    grouped_runs: dict[int, list[tuple[int, int, int]]] = {}
+    for y, start, end, label in runs:
+        grouped_runs.setdefault(find(label), []).append((y, start, end))
+
+    components: list[dict] = []
+    for component_runs in grouped_runs.values():
+        area = sum(end - start + 1 for _y, start, end in component_runs)
+        x_sum = sum((start + end) * (end - start + 1) / 2 for _y, start, end in component_runs)
+        y_sum = sum(y * (end - start + 1) for y, start, end in component_runs)
+        components.append({
+            "area": area,
+            "x": x_sum / area,
+            "y": y_sum / area,
+            "left": min(start for _y, start, _end in component_runs),
+            "top": min(y for y, _start, _end in component_runs),
+            "right": max(end for _y, _start, end in component_runs),
+            "bottom": max(y for y, _start, _end in component_runs),
+            "runs": component_runs,
         })
-    return found
+    return components
 
 
-def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio: float) -> dict:
+def analyze_image(
+    path: str | Path,
+    min_diameter_percent: float,
+    contrast_ratio: float,
+    annotate: bool = True,
+) -> dict:
     """Look for a dark, connected spot inside a bright circular field."""
-    original = Image.open(path).convert("RGB")
-    original_size = original.size
-    work = original.copy()
+    with Image.open(path) as source:
+        original_size = source.size
+        original = source.convert("RGB") if annotate else None
+        # Avoid copying a full-resolution TIFF/JPEG before reducing it for the
+        # scan. The original is retained only for the interactive test window.
+        work = source
     work.thumbnail((MAX_ANALYSIS_SIDE, MAX_ANALYSIS_SIDE), Image.Resampling.LANCZOS)
+    work = work.convert("RGB")
     rgb = np.asarray(work, dtype=np.uint8)
 
     red = rgb[:, :, 0].astype(np.float32)
@@ -171,11 +204,18 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
     # mistaken for a defect, while preserving defects that touch the perimeter.
     radial_bins = np.floor(radial_distance).astype(np.int32)
     max_bin = int(min(np.max(radial_bins), math.ceil(radius * 1.06))) + 1
+    signal_uint8 = np.clip(signal, 0, 255).astype(np.uint8)
+    bin_values = radial_bins[inside] * 256 + signal_uint8[inside]
+    histogram = np.bincount(
+        bin_values,
+        minlength=(max_bin + 1) * 256,
+    ).reshape(max_bin + 1, 256)
+    bin_counts = histogram.sum(axis=1)
+    cumulative = np.cumsum(histogram, axis=1)
+    median_targets = ((bin_counts + 1) // 2)[:, None]
     profile = np.full(max_bin + 1, np.nan, dtype=np.float32)
-    for bin_index in range(max_bin + 1):
-        values = signal[inside & (radial_bins == bin_index)]
-        if values.size:
-            profile[bin_index] = float(np.median(values))
+    nonempty = bin_counts > 0
+    profile[nonempty] = np.argmax(cumulative[nonempty] >= median_targets[nonempty], axis=1)
     known = np.flatnonzero(np.isfinite(profile))
     if known.size < 3:
         return {
@@ -188,7 +228,7 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
     expected_radial = profile[np.minimum(radial_bins, len(profile) - 1)]
 
     blur_radius = max(2.0, radius * 0.035)
-    channel_image = Image.fromarray(np.clip(signal, 0, 255).astype(np.uint8), mode="L")
+    channel_image = Image.fromarray(signal_uint8)
     local_background = np.asarray(
         channel_image.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32
     )
@@ -202,17 +242,24 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
     components = _connected_components(dark_mask)
     accepted: list[dict] = []
     for component in components:
-        x_values = np.asarray(component.pop("x_values"), dtype=np.int32)
-        y_values = np.asarray(component.pop("y_values"), dtype=np.int32)
-        component_radii = np.sqrt((x_values - cx) ** 2 + (y_values - cy) ** 2)
-        touches_edge = bool(np.max(component_radii) >= radius * 0.965)
+        farthest_radius = max(
+            math.hypot(x - cx, y - cy)
+            for y, left, right in component["runs"]
+            for x in (left, right)
+        )
+        touches_edge = farthest_radius >= radius * 0.965
         needed_area = max(5, int(min_area * (0.48 if touches_edge else 1.0)))
         if component["area"] < needed_area:
             continue
-        patch_values = signal[y_values, x_values]
-        patch_expected = expected[y_values, x_values]
-        very_dark_fraction = float(np.mean(patch_values < patch_expected * 0.55))
-        average_contrast = float(np.mean(patch_expected - patch_values))
+        very_dark_count = 0
+        contrast_total = 0.0
+        for y, left, right in component["runs"]:
+            patch_values = signal[y, left:right + 1]
+            patch_expected = expected[y, left:right + 1]
+            very_dark_count += int(np.count_nonzero(patch_values < patch_expected * 0.55))
+            contrast_total += float(np.sum(patch_expected - patch_values))
+        very_dark_fraction = very_dark_count / component["area"]
+        average_contrast = contrast_total / component["area"]
         if very_dark_fraction < (0.28 if touches_edge else 0.38):
             continue
         if average_contrast < 18:
@@ -224,14 +271,15 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
     accepted.sort(key=lambda item: item["area"], reverse=True)
     scale_x = original_size[0] / width
     scale_y = original_size[1] / height
-    draw = ImageDraw.Draw(original)
-    disk_box = (
-        (cx - radius) * scale_x,
-        (cy - radius) * scale_y,
-        (cx + radius) * scale_x,
-        (cy + radius) * scale_y,
-    )
-    draw.ellipse(disk_box, outline=(255, 205, 0), width=max(3, original_size[0] // 700))
+    draw = ImageDraw.Draw(original) if annotate and original is not None else None
+    if draw is not None:
+        disk_box = (
+            (cx - radius) * scale_x,
+            (cy - radius) * scale_y,
+            (cx + radius) * scale_x,
+            (cy + radius) * scale_y,
+        )
+        draw.ellipse(disk_box, outline=(255, 205, 0), width=max(3, original_size[0] // 700))
     spots: list[dict] = []
     for component in accepted:
         left = component["left"] * scale_x
@@ -240,10 +288,11 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
         bottom = (component["bottom"] + 1) * scale_y
         pad_x = max(7, (right - left) * 0.22)
         pad_y = max(7, (bottom - top) * 0.22)
-        draw.ellipse(
-            (left - pad_x, top - pad_y, right + pad_x, bottom + pad_y),
-            outline=(255, 40, 40), width=max(4, original_size[0] // 500),
-        )
+        if draw is not None:
+            draw.ellipse(
+                (left - pad_x, top - pad_y, right + pad_x, bottom + pad_y),
+                outline=(255, 40, 40), width=max(4, original_size[0] // 500),
+            )
         spots.append({
             "x": component["x"] * scale_x,
             "y": component["y"] * scale_y,
@@ -257,13 +306,16 @@ def analyze_image(path: str | Path, min_diameter_percent: float, contrast_ratio:
     }
 
 
-def scan_folders(config: dict) -> list[dict]:
+def scan_folders(config: dict, progress_callback=None) -> list[dict]:
     groups: dict[str, dict] = {}
     pattern = str(config.get("filename_pattern", "picture_2")).strip().casefold()
     roots = [
         ("gray", str(config.get("folder_gray", "")).strip()),
         ("green", str(config.get("folder_green", "")).strip()),
     ]
+    if progress_callback:
+        progress_callback({"phase": "search", "message": "Recherche des dossiers et des images…"})
+    discovered_folders = 0
     for kind, root_text in roots:
         if not root_text:
             continue
@@ -287,6 +339,12 @@ def scan_folders(config: dict) -> list[dict]:
                 product_folders = top_level_folders
             if product_folders:
                 for product_folder in product_folders:
+                    discovered_folders += 1
+                    if progress_callback and discovered_folders % 10 == 0:
+                        progress_callback({
+                            "phase": "search",
+                            "message": f"Recherche des images… {product_folder.name}",
+                        })
                     product_name = product_folder.name.strip()
                     if not product_name:
                         continue
@@ -316,13 +374,17 @@ def scan_folders(config: dict) -> list[dict]:
     results: list[dict] = []
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
+    total_images = sum(len(group[kind]) for group in groups.values() for kind in ("gray", "green"))
+    if progress_callback:
+        progress_callback({"phase": "process", "done": 0, "total": total_images})
+    processed_images = 0
     for group_key in sorted(groups, key=str.casefold):
         group = groups[group_key]
         states = {"gray": None, "green": None}
         image_paths = {"gray": [], "green": []}
         errors: list[str] = []
         for kind in ("gray", "green"):
-            paths = sorted(group[kind], key=lambda p: str(p).casefold())
+            paths = group[kind]
             if not paths:
                 continue
             detected_any = False
@@ -338,11 +400,13 @@ def scan_folders(config: dict) -> list[dict]:
                     with ANALYSIS_CACHE_LOCK:
                         cached = ANALYSIS_CACHE.get(cache_key)
                     if cached is None:
-                        detection = analyze_image(image_path, min_diameter, contrast_ratio)
+                        detection = analyze_image(image_path, min_diameter, contrast_ratio, annotate=False)
                         cached = (bool(detection["detected"]), detection["mode"], detection["error"])
-                        if not detection["error"]:
-                            with ANALYSIS_CACHE_LOCK:
-                                ANALYSIS_CACHE[cache_key] = cached
+                        # Cache both positive and negative results. Static images
+                        # with no usable disk would otherwise be decoded again on
+                        # every automatic refresh.
+                        with ANALYSIS_CACHE_LOCK:
+                            ANALYSIS_CACHE[cache_key] = cached
                     if cached[2]:
                         errors.append(f"{image_path.name}: {cached[2]}")
                     else:
@@ -350,6 +414,16 @@ def scan_folders(config: dict) -> list[dict]:
                         detected_any = detected_any or cached[0]
                 except Exception as exc:
                     errors.append(f"{image_path.name}: {exc}")
+                finally:
+                    processed_images += 1
+                    if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
+                        progress_callback({
+                            "phase": "process",
+                            "done": processed_images,
+                            "total": total_images,
+                            "product": group["product_name"],
+                            "image": image_path.name,
+                        })
             if detected_any:
                 states[kind] = True
             elif valid_count == len(paths):
@@ -378,18 +452,18 @@ def scan_folders(config: dict) -> list[dict]:
             "image_paths": image_paths,
             "errors": errors,
         })
+    if progress_callback:
+        progress_callback({"phase": "save", "done": total_images, "total": total_images})
     return results
 
 
 def save_results(results: list[dict], config: dict) -> tuple[int, int]:
     analysis_date = str(config["analysis_date"])
-    size = str(config["size"])
     scanned_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DATABASE_FILE) as connection:
         connection.execute("""
-            CREATE TABLE IF NOT EXISTS comparisons (
+            CREATE TABLE IF NOT EXISTS comparisons_all_sizes (
                 analysis_date TEXT NOT NULL,
-                size TEXT NOT NULL,
                 product_key TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 gray_state TEXT NOT NULL,
@@ -399,20 +473,20 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
                 image_paths TEXT NOT NULL,
                 error_text TEXT NOT NULL,
                 scanned_at TEXT NOT NULL,
-                PRIMARY KEY (analysis_date, size, product_key)
+                PRIMARY KEY (analysis_date, product_key)
             )
         """)
         connection.execute(
-            "DELETE FROM comparisons WHERE analysis_date=? AND size=?",
-            (analysis_date, size),
+            "DELETE FROM comparisons_all_sizes WHERE analysis_date=?",
+            (analysis_date,),
         )
         for row in results:
             gray_state = "oui" if row["gray_state"] is True else "non" if row["gray_state"] is False else "—"
             green_state = "oui" if row["green_state"] is True else "non" if row["green_state"] is False else "—"
             connection.execute("""
-                INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO comparisons_all_sizes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                analysis_date, size, row["group_key"], row["display_name"],
+                analysis_date, row["group_key"], row["display_name"],
                 gray_state, green_state, row["category"], int(row["comparable"]),
                 json.dumps(row["image_paths"], ensure_ascii=False),
                 " | ".join(row["errors"]), scanned_at,
@@ -422,14 +496,14 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
     return total, with_defect
 
 
-def read_current_results(analysis_date: str, size: str) -> list[tuple]:
+def read_current_results(analysis_date: str) -> list[tuple]:
     if not DATABASE_FILE.exists():
         return []
     try:
         with sqlite3.connect(DATABASE_FILE) as connection:
             return connection.execute("""
                 SELECT display_name, gray_state, green_state, category, comparable, error_text
-                FROM comparisons WHERE analysis_date=? AND size=?
+                FROM comparisons_all_sizes WHERE analysis_date=?
                 ORDER BY CASE category
                     WHEN 'Dossier 1 uniquement' THEN 1
                     WHEN 'Présent dans les deux' THEN 2
@@ -437,7 +511,7 @@ def read_current_results(analysis_date: str, size: str) -> list[tuple]:
                     WHEN 'Aucun claquage' THEN 4
                     ELSE 5 END,
                     display_name COLLATE NOCASE
-            """, (analysis_date, size)).fetchall()
+            """, (analysis_date,)).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).casefold():
             return []
@@ -517,7 +591,6 @@ class SettingsWindow:
         self.folder_green = StringVar(value=app.config.get("folder_green", ""))
         self.pattern = StringVar(value=app.config.get("filename_pattern", "picture_2"))
         self.analysis_date = StringVar(value=app.config.get("analysis_date", date.today().isoformat()))
-        self.size = StringVar(value=app.config.get("size", "16 mm"))
         self.interval = StringVar(value=str(app.config.get("interval_seconds", 30)))
         self.min_diameter = StringVar(value=str(app.config.get("min_spot_diameter_percent", 1.8)))
         self.contrast = StringVar(value=str(app.config.get("contrast_ratio", 0.20)))
@@ -540,11 +613,9 @@ class SettingsWindow:
         metadata.pack(fill="x", pady=5)
         ttk.Label(metadata, text="Date (AAAA-MM-JJ)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(metadata, textvariable=self.analysis_date, width=18).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(metadata, text="Taille du module").grid(row=0, column=2, sticky="w", padx=(20, 5), pady=5)
-        ttk.Combobox(metadata, textvariable=self.size, values=("16 mm", "18 mm", "Autre"), width=12, state="readonly").grid(row=0, column=3, sticky="w", padx=5, pady=5)
         ttk.Label(metadata, text="Motif du nom de l’image").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(metadata, textvariable=self.pattern, width=20).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(metadata, text="Exemple : picture_2").grid(row=1, column=2, columnspan=2, sticky="w", padx=5, pady=5)
+        ttk.Label(metadata, text="Exemple : picture_2 · tailles 16 et 18 mm regroupées").grid(row=1, column=2, columnspan=2, sticky="w", padx=5, pady=5)
 
         detection = ttk.LabelFrame(body, text="Réglage de détection", padding=10)
         detection.pack(fill="x", pady=5)
@@ -607,7 +678,6 @@ class SettingsWindow:
             "folder_green": self.folder_green.get().strip(),
             "filename_pattern": self.pattern.get().strip(),
             "analysis_date": self.analysis_date.get().strip(),
-            "size": self.size.get(),
             "interval_seconds": interval,
             "min_spot_diameter_percent": min_diameter,
             "contrast_ratio": contrast,
@@ -659,6 +729,8 @@ class MonitorApp:
         self.config = load_config()
         self.settings_window: SettingsWindow | None = None
         self.scan_running = False
+        self.progress_queue: queue.Queue = queue.Queue()
+        self.progress_mode = "determinate"
         self.next_scan_id: str | None = None
         self.category_names = (
             "Dossier 1 uniquement",
@@ -669,6 +741,7 @@ class MonitorApp:
         self.rate_count_vars = {name: StringVar(value="0 / 0 produit") for name in self.category_names}
         self.count_var = StringVar(value="En attente des paramètres")
         self.status_var = StringVar(value="Surveillance arrêtée")
+        self.progress_text_var = StringVar(value="Prêt")
         self.filter_var = StringVar(value="")
         self._build_main_window()
         self.refresh_summary()
@@ -704,6 +777,11 @@ class MonitorApp:
 
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 10)).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))
+        progress_row = ttk.Frame(frame)
+        progress_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(progress_row, textvariable=self.progress_text_var, width=34, anchor="w").pack(side="left")
+        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate", maximum=1, length=200)
+        self.progress_bar.pack(side="right", fill="x", expand=True, padx=(8, 0))
         ttk.Label(frame, textvariable=self.status_var, foreground="#555555").pack(pady=(0, 4))
 
         columns = ("produit", "gris", "vert", "categorie")
@@ -760,15 +838,59 @@ class MonitorApp:
         if missing:
             self.status_var.set("Dossier introuvable : " + ", ".join(missing))
             return
+        while True:
+            try:
+                self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
         self.scan_running = True
         self.status_var.set("Analyse en cours…")
+        self.progress_text_var.set("Recherche des images…")
+        self.progress_bar.configure(mode="indeterminate", maximum=100, value=0)
+        self.progress_bar.start(12)
         worker = threading.Thread(target=self._scan_worker, args=(config,), daemon=True)
         worker.start()
+        self.root.after(100, self._poll_progress)
+
+    def _poll_progress(self) -> None:
+        latest = None
+        while True:
+            try:
+                latest = self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest:
+            phase = latest.get("phase")
+            if phase == "search":
+                if self.progress_mode != "indeterminate":
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="indeterminate")
+                    self.progress_bar.start(12)
+                    self.progress_mode = "indeterminate"
+                self.progress_text_var.set(latest.get("message", "Recherche des images…"))
+            elif phase in {"process", "save"}:
+                if self.progress_mode != "determinate":
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="determinate")
+                    self.progress_mode = "determinate"
+                total = int(latest.get("total", 0))
+                done = int(latest.get("done", 0))
+                self.progress_bar.configure(maximum=max(1, total), value=done)
+                if phase == "save":
+                    self.progress_text_var.set("Calcul des taux…")
+                elif total:
+                    self.progress_text_var.set(
+                        f"{done}/{total} images · {latest.get('product', '')}"
+                    )
+                else:
+                    self.progress_text_var.set("Aucune image trouvée")
+        if self.scan_running:
+            self.root.after(100, self._poll_progress)
 
     def _scan_worker(self, config: dict) -> None:
         started = time.monotonic()
         try:
-            results = scan_folders(config)
+            results = scan_folders(config, progress_callback=self.progress_queue.put)
             total, defects = save_results(results, config)
             duration = time.monotonic() - started
             self.root.after(0, lambda: self._scan_finished(results, total, defects, duration, ""))
@@ -777,22 +899,32 @@ class MonitorApp:
 
     def _scan_finished(self, results: list[dict], total: int, defects: int, duration: float, error: str) -> None:
         self.scan_running = False
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", maximum=1, value=0 if error else 1)
+        self.progress_mode = "determinate"
         if error:
+            self.progress_text_var.set("Échec de l’analyse")
             self.status_var.set("Erreur d’analyse")
             messagebox.showerror("Erreur", error, parent=self.root)
             return
         self.refresh_summary()
         if not results:
+            self.progress_text_var.set("Aucune image trouvée")
             self.status_var.set("Aucune image correspondant au motif")
         elif total == 0:
-            self.status_var.set("Aucune paire grise/verte analysable pour les mêmes produits")
+            gray_products = sum(bool(row["image_paths"]["gray"]) for row in results)
+            green_products = sum(bool(row["image_paths"]["green"]) for row in results)
+            self.progress_text_var.set(
+                f"0 paire exploitable · gris {gray_products} / vert {green_products}"
+            )
+            self.status_var.set("Vérifier les numéros produit, le motif et la qualité des images")
         else:
+            self.progress_text_var.set(f"Analyse terminée · {sum(len(row['image_paths']['gray']) + len(row['image_paths']['green']) for row in results)} images")
             self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
 
     def refresh_summary(self) -> None:
         analysis_date = str(self.config.get("analysis_date", date.today().isoformat()))
-        size = str(self.config.get("size", "16 mm"))
-        rows = read_current_results(analysis_date, size)
+        rows = read_current_results(analysis_date)
         comparable_rows = [row for row in rows if row[4]]
         total = len(comparable_rows)
         category_counts = {
@@ -811,7 +943,7 @@ class MonitorApp:
                 self.rate_vars[category].set("— %")
                 self.rate_count_vars[category].set("0 / 0 produit")
             self.count_var.set("Aucun produit analysable dans les deux dossiers")
-        self.filter_var.set(f"{analysis_date} · {size}")
+        self.filter_var.set(f"{analysis_date} · toutes tailles de module")
         for item in self.table.get_children():
             self.table.delete(item)
         tags = {
@@ -859,13 +991,13 @@ class MonitorApp:
         try:
             with sqlite3.connect(DATABASE_FILE) as connection:
                 rows = connection.execute("""
-                    SELECT analysis_date, size, display_name, gray_state, green_state,
+                    SELECT analysis_date, display_name, gray_state, green_state,
                            category, comparable, image_paths, error_text, scanned_at
-                    FROM comparisons ORDER BY analysis_date DESC, size, display_name COLLATE NOCASE
+                    FROM comparisons_all_sizes ORDER BY analysis_date DESC, display_name COLLATE NOCASE
                 """).fetchall()
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
-                writer.writerow(("Date", "Taille", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
+                writer.writerow(("Date", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
                 writer.writerows(rows)
             self.status_var.set("Rapport CSV exporté")
         except Exception as exc:

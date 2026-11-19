@@ -20,7 +20,7 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 ## Comparaison des deux dossiers
 
-Dans le dossier 1, les sous-dossiers de premier niveau portent les numéros produit. Dans le dossier 2, un sous-dossier de regroupement précède les sous-dossiers par numéro produit. Le logiciel associe les produits à partir du nom du dossier numéro, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit.
+Dans le dossier 1, les sous-dossiers de premier niveau portent les numéros produit. Dans le dossier 2, un sous-dossier de regroupement précède les sous-dossiers par numéro produit. Le logiciel associe les produits à partir du nom du dossier numéro, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit. Les modules 16 mm et 18 mm sont regroupés : la taille n’entre pas dans le calcul.
 
 Pour calculer le taux « dossier 2 uniquement », le logiciel doit aussi analyser les images vertes des produits qui n’ont pas été détectés en gris. Les trois taux affichés utilisent le même dénominateur : le nombre de produits ayant une image analysable dans chacun des deux dossiers.
 
@@ -35,9 +35,10 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 - Petite fenêtre avec le taux de claquage, le nombre de dossiers analysés et leur résultat.
 - Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre.
 - Surveillance périodique de deux dossiers facultatifs : images en niveaux de gris et images vertes.
+- Barre de progression pendant la recherche et l’analyse des images.
 - Parcours des sous-dossiers et recherche des fichiers dont le nom contient `picture_2`.
 - Détection des points sombres sur le disque lumineux, y compris près de sa périphérie.
-- Réglages de date, taille du module, fréquence d’analyse, diamètre minimal du point et contraste.
+- Réglages de date, fréquence d’analyse, diamètre minimal du point et contraste.
 - Mode essai pour une ou plusieurs images, avec résultat et zone détectée entourée.
 - Export de l’historique en CSV.
 
@@ -45,6 +46,6 @@ Les résultats sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`.
 
 ## Règle de calcul
 
-Les taux sont calculés sur les produits comparables pour la date et la taille sélectionnées. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur.
+Les taux sont calculés sur les produits comparables pour la date sélectionnée, toutes tailles de module confondues. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.
