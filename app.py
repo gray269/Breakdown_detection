@@ -5,6 +5,7 @@ import json
 import math
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -19,7 +20,6 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 APP_NAME = "SuiviClaquage"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
-QUICK_ANALYSIS_SIDE = 512
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
@@ -324,6 +324,18 @@ def _date_folder_key(folder_name: str) -> str | None:
     return None
 
 
+def _canonical_product_name(folder_name: str) -> str:
+    """Remove a trailing capture timestamp from product folders, if present."""
+    name = folder_name.strip()
+    match = re.fullmatch(r"(\d+)_(?:\d{8}|\d{14})", name)
+    return match.group(1) if match else name
+
+
+def _exception_description(exc: Exception) -> str:
+    """Include exception type and arguments, even when str(exc) is empty."""
+    return f"{type(exc).__name__}: {exc!r}"
+
+
 def _folder_created_date(folder: Path) -> date | None:
     """Read the folder creation date (st_birthtime where available, Windows ctime otherwise)."""
     try:
@@ -390,7 +402,7 @@ def scan_folders(config: dict, progress_callback=None) -> list[dict]:
 
 
 def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: sqlite3.Connection) -> list[dict]:
-    """Scan exact picture_2 images only for product folders created in the selected interval."""
+    """Scan exact picture_2 images for product/date folders in the selected interval."""
     groups: dict[str, dict] = {}
     pattern = str(config.get("filename_pattern", "picture_2")).strip().casefold()
     start_date = datetime.strptime(config["analysis_start_date"], "%Y-%m-%d").date()
@@ -398,7 +410,7 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
     if progress_callback:
         progress_callback({
             "phase": "search",
-            "message": f"Recherche des dossiers créés du {start_date:%d/%m/%Y} au {end_date:%d/%m/%Y}…",
+            "message": f"Recherche des dossiers picture_2 du {start_date:%d/%m/%Y} au {end_date:%d/%m/%Y}…",
         })
 
     roots = [("gray", str(config.get("folder_gray", "")).strip()),
@@ -412,48 +424,70 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
         try:
             top_folders = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold())
             if kind == "gray":
-                product_folders = top_folders
+                product_folders = [(item, None) for item in top_folders]
             else:
-                # Green layout can be either root/date/product or a selected
-                # date folder/product. The interval is determined by product
-                # folder creation time, not by the date folder's name.
+                # Green layout can be root/date/product or a selected date
+                # folder/product. Use the YYYYMMDD date-folder name when it is
+                # available; product-folder creation times can change when
+                # data is copied and do not identify the image capture date.
                 root_date_key = _date_folder_key(root.name)
                 dated_children = [item for item in top_folders if _date_folder_key(item.name)]
                 if root_date_key is not None:
-                    product_folders = top_folders
+                    root_date = date.fromisoformat(root_date_key)
+                    product_folders = (
+                        [(item, root_date) for item in top_folders]
+                        if start_date <= root_date <= end_date else []
+                    )
                 elif dated_children:
                     product_folders = []
                     for date_folder in dated_children:
+                        folder_date = date.fromisoformat(_date_folder_key(date_folder.name))
+                        if not start_date <= folder_date <= end_date:
+                            continue
                         product_folders.extend(
-                            item for item in date_folder.iterdir() if item.is_dir()
+                            (item, folder_date)
+                            for item in date_folder.iterdir() if item.is_dir()
                         )
-                    product_folders.sort(key=lambda item: item.name.casefold())
                 else:
                     # Also handle date-folder labels that are not parseable as
                     # a numeric date: a date/grouping folder contains product
-                    # directories, while a product folder contains image files.
-                    nested_folders = []
+                    # directories. In this fallback, product-folder creation
+                    # time is the only available date signal.
+                    nested_folders: list[tuple[Path, date | None]] = []
                     for possible_date_folder in top_folders:
                         nested_folders.extend(
-                            item for item in possible_date_folder.iterdir() if item.is_dir()
+                            (item, None)
+                            for item in possible_date_folder.iterdir() if item.is_dir()
                         )
                     product_folders = sorted(
-                        nested_folders or top_folders,
-                        key=lambda item: item.name.casefold(),
+                        nested_folders or [(item, None) for item in top_folders],
+                        key=lambda item: item[0].name.casefold(),
                     )
-            for product_folder in product_folders:
+            product_folders.sort(key=lambda item: (
+                _canonical_product_name(item[0].name).casefold(),
+                item[0].name.casefold() != _canonical_product_name(item[0].name).casefold(),
+                item[0].name.casefold(),
+            ))
+            folder_total = len(product_folders)
+            for folder_index, (product_folder, date_from_parent) in enumerate(product_folders, start=1):
+                if progress_callback and (folder_index == 1 or folder_index % 50 == 0 or folder_index == folder_total):
+                    progress_callback({
+                        "phase": "search_progress", "done": folder_index,
+                        "total": folder_total, "source": "gris" if kind == "gray" else "vert",
+                    })
                 product_name = product_folder.name.strip()
                 if not product_name:
                     continue
-                created_on = _folder_created_date(product_folder)
+                created_on = date_from_parent or _folder_created_date(product_folder)
                 if created_on is None or not start_date <= created_on <= end_date:
                     continue
-                product_key = product_name.casefold()
+                canonical_name = _canonical_product_name(product_name)
+                product_key = canonical_name.casefold()
                 entry = groups.setdefault(product_key, {
-                    "product_name": product_name, "gray": None, "green": None,
+                    "product_name": canonical_name, "gray": None, "green": None,
                 })
                 image_path = _picture_2_in(product_folder, pattern)
-                if image_path is not None:
+                if image_path is not None and entry[kind] is None:
                     entry[kind] = image_path
         except OSError:
             continue
@@ -506,25 +540,20 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
     states = {key: {"gray": None, "green": None} for key in ordered_keys}
     errors = {key: [] for key in ordered_keys}
 
-    # Complete the gray pass first. Use a quick image pass for likely negatives;
-    # analyze only positive or ambiguous candidates at the larger working size.
+    # Complete the gray pass first at the same resolution as the test window.
     for key in ordered_keys:
         image_path = groups[key]["gray"]
         if image_path is None:
             continue
-        gray_pass = "gris confirmé"
+        gray_pass = "gris"
         try:
-            detected, _mode, error = detect(image_path, QUICK_ANALYSIS_SIDE)
-            gray_pass = "gris rapide"
-            if detected or error:
-                detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
-                gray_pass = "gris confirmé"
+            detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
             else:
                 states[key]["gray"] = detected
         except Exception as exc:
-            errors[key].append(f"{image_path.name}: {exc}")
+            errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
         processed_images += 1
         if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
             progress_callback({
@@ -532,8 +561,8 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                 "product": groups[key]["product_name"], "source": gray_pass,
             })
 
-    # Green images are limited to product folders created in the selected
-    # interval. Gray-negative products use a faster green-only first pass.
+    # Green images are limited to date/product folders in the selected
+    # interval. Gray-negative products also need a green result for rate 3.
     for key in ordered_keys:
         image_path = groups[key]["green"]
         if image_path is None:
@@ -548,23 +577,15 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                     "product": groups[key]["product_name"], "source": "vert ignoré",
                 })
             continue
-        green_pass = "vert complet"
+        green_pass = "vert"
         try:
-            if states[key]["gray"]:
-                detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
-                green_pass = "vert complet"
-            else:
-                detected, _mode, error = detect(image_path, QUICK_ANALYSIS_SIDE)
-                green_pass = "vert rapide"
-                if detected or error:
-                    detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
-                    green_pass = "vert confirmé"
+            detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
             else:
                 states[key]["green"] = detected
         except Exception as exc:
-            errors[key].append(f"{image_path.name}: {exc}")
+            errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
         processed_images += 1
         if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
             progress_callback({
@@ -714,7 +735,7 @@ class ImageTestWindow:
             self.image_label.configure(image=self.photo)
         except Exception as exc:
             self.summary.configure(text="Image impossible à analyser")
-            self.details.configure(text=f"{Path(path).name} · {exc}")
+            self.details.configure(text=f"{Path(path).name} · {_exception_description(exc)}")
             self.image_label.configure(image="")
 
     def previous(self) -> None:
@@ -751,7 +772,7 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient les sous-dossiers par date, puis par numéro produit. La période sélectionnée filtre les dossiers produit selon leur date de création dans les deux sources. Dans chaque dossier produit, seule l’image nommée exactement picture_2 est retenue.",
+            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient les sous-dossiers par date, puis par numéro produit. La période filtre la date de création des dossiers gris et la date du dossier vert (format AAAAMMJJ). Les dossiers gris suffixés par un horodatage sont associés au numéro produit de base. Seule l’image nommée exactement picture_2 est retenue.",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
@@ -786,7 +807,7 @@ class SettingsWindow:
 
         note = ttk.Label(
             body,
-            text="Les dates filtrent la date de création des dossiers produit dans les deux sources. Pour calculer le taux « dossier 2 uniquement », les images vertes des produits sans défaut gris passent par un tri rapide. Les détections sont conservées localement et réutilisées si le fichier et les réglages n’ont pas changé. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
+            text="Pour le dossier vert, les dossiers date AAAAMMJJ sont filtrés directement sur la période. Pour le dossier gris, la date de création du dossier produit est utilisée. Les images passent par la même résolution de détection que le mode essai afin de garder les mêmes résultats. Les détections sont conservées localement et réutilisées si le fichier et les réglages n’ont pas changé. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
             wraplength=730,
         )
         note.pack(anchor="w", pady=10)
@@ -1025,6 +1046,17 @@ class MonitorApp:
                     self.progress_bar.start(12)
                     self.progress_mode = "indeterminate"
                 self.progress_text_var.set(latest.get("message", "Recherche des images…"))
+            elif phase == "search_progress":
+                if self.progress_mode != "determinate":
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="determinate")
+                    self.progress_mode = "determinate"
+                total = int(latest.get("total", 0))
+                done = int(latest.get("done", 0))
+                self.progress_bar.configure(maximum=max(1, total), value=done)
+                self.progress_text_var.set(
+                    f"Dossiers {latest.get('source', '')} · {done}/{total}"
+                )
             elif phase in {"process", "save"}:
                 if self.progress_mode != "determinate":
                     self.progress_bar.stop()
@@ -1034,7 +1066,7 @@ class MonitorApp:
                 done = int(latest.get("done", 0))
                 self.progress_bar.configure(maximum=max(1, total), value=done)
                 if phase == "save":
-                    self.progress_text_var.set("Calcul des taux…")
+                    self.progress_text_var.set("Enregistrement des résultats…")
                 elif total:
                     self.progress_text_var.set(
                         f"{done}/{total} · {latest.get('source', '')} · {latest.get('product', '')}"
@@ -1071,10 +1103,12 @@ class MonitorApp:
         elif total == 0:
             gray_products = sum(bool(row["image_paths"]["gray"]) for row in results)
             green_products = sum(bool(row["image_paths"]["green"]) for row in results)
-            self.progress_text_var.set(
-                f"0 paire exploitable · gris {gray_products} / vert {green_products}"
-            )
-            self.status_var.set("Vérifier les dates, numéros produit et la présence de picture_2")
+            error_count = sum(len(row["errors"]) for row in results)
+            self.progress_text_var.set(f"Terminé · 0 paire comparable · gris {gray_products} / vert {green_products}")
+            if error_count:
+                self.status_var.set(f"{error_count} erreur(s) d’image · consultez le CSV pour le détail")
+            else:
+                self.status_var.set("Vérifier la période, les numéros produit et les images picture_2")
         else:
             self.progress_text_var.set(f"Analyse terminée · {sum(len(row['image_paths']['gray']) + len(row['image_paths']['green']) for row in results)} images")
             self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
