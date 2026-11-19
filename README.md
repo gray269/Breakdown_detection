@@ -20,7 +20,7 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 ## Comparaison des deux dossiers
 
-Le nom du sous-dossier de premier niveau est le numéro produit. Le logiciel associe les produits entre les dossiers 1 et 2 à partir de ce nom, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit.
+Dans le dossier 1, les sous-dossiers de premier niveau portent les numéros produit. Dans le dossier 2, un sous-dossier de regroupement précède les sous-dossiers par numéro produit. Le logiciel associe les produits à partir du nom du dossier numéro, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit.
 
 Pour calculer le taux « dossier 2 uniquement », le logiciel doit aussi analyser les images vertes des produits qui n’ont pas été détectés en gris. Les trois taux affichés utilisent le même dénominateur : le nombre de produits ayant une image analysable dans chacun des deux dossiers.
 
@@ -33,6 +33,7 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 ## Fonctions de l’application
 
 - Petite fenêtre avec le taux de claquage, le nombre de dossiers analysés et leur résultat.
+- Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre.
 - Surveillance périodique de deux dossiers facultatifs : images en niveaux de gris et images vertes.
 - Parcours des sous-dossiers et recherche des fichiers dont le nom contient `picture_2`.
 - Détection des points sombres sur le disque lumineux, y compris près de sa périphérie.

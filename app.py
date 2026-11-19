@@ -271,10 +271,20 @@ def scan_folders(config: dict) -> list[dict]:
         if not root.is_dir():
             continue
         try:
-            product_folders = sorted(
+            top_level_folders = sorted(
                 (item for item in root.iterdir() if item.is_dir()),
                 key=lambda item: item.name.casefold(),
             )
+            if kind == "green":
+                # Green-image export layout: root / grouping folder / product ID.
+                product_folders = []
+                for grouping_folder in top_level_folders:
+                    product_folders.extend(
+                        item for item in grouping_folder.iterdir() if item.is_dir()
+                    )
+                product_folders.sort(key=lambda item: item.name.casefold())
+            else:
+                product_folders = top_level_folders
             if product_folders:
                 for product_folder in product_folders:
                     product_name = product_folder.name.strip()
@@ -501,6 +511,7 @@ class SettingsWindow:
         self.window.minsize(700, 600)
         self.window.transient(app.root)
         self.window.grab_set()
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.folder_gray = StringVar(value=app.config.get("folder_gray", ""))
         self.folder_green = StringVar(value=app.config.get("folder_green", ""))
@@ -516,7 +527,7 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Chaque sous-dossier de premier niveau correspond à un numéro produit. Le logiciel compare le même numéro dans les deux dossiers et cherche les fichiers dont le nom contient le motif indiqué.",
+            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient un niveau de regroupement supplémentaire, puis les sous-dossiers par numéro produit. Le logiciel associe les deux images avec le même numéro.",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
@@ -561,7 +572,7 @@ class SettingsWindow:
         ttk.Button(actions, text="Tester des images…", command=self.test_images).pack(side="left")
         ttk.Button(actions, text="Enregistrer", command=self.save).pack(side="right", padx=(6, 0))
         ttk.Button(actions, text="Analyser maintenant", command=self.save_and_scan).pack(side="right", padx=6)
-        ttk.Button(actions, text="Fermer", command=self.window.destroy).pack(side="right", padx=6)
+        ttk.Button(actions, text="Fermer", command=self.close).pack(side="right", padx=6)
 
     @staticmethod
     def _folder_row(parent: ttk.LabelFrame, label: str, variable: StringVar, row: int) -> None:
@@ -608,8 +619,19 @@ class SettingsWindow:
         if config is None:
             return False
         self.app.set_config(config)
-        self.window.destroy()
+        self.close()
         return True
+
+    def close(self) -> None:
+        try:
+            self.window.grab_release()
+        except Exception:
+            pass
+        try:
+            self.window.destroy()
+        except Exception:
+            pass
+        self.app.settings_window = None
 
     def save_and_scan(self) -> None:
         if self.save():
@@ -698,7 +720,7 @@ class MonitorApp:
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Paramètres", command=self.open_settings).pack(side="left")
+        ttk.Button(buttons, text="Réouvrir les paramètres", command=self.open_settings).pack(side="left")
         ttk.Button(buttons, text="Analyser", command=self.scan_now).pack(side="left", padx=6)
         ttk.Button(buttons, text="CSV", command=self.export_csv).pack(side="left")
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
@@ -711,9 +733,15 @@ class MonitorApp:
         self.schedule_next_scan(2)
 
     def open_settings(self) -> None:
-        if self.settings_window and self.settings_window.window.winfo_exists():
-            self.settings_window.window.lift()
-            return
+        if self.settings_window:
+            try:
+                if self.settings_window.window.winfo_exists():
+                    self.settings_window.window.deiconify()
+                    self.settings_window.window.lift()
+                    self.settings_window.window.focus_force()
+                    return
+            except Exception:
+                pass
         self.settings_window = SettingsWindow(self)
 
     def scan_now(self) -> None:
