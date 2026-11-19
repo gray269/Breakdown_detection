@@ -1,0 +1,38 @@
+name: Construire l'executable Windows
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Recuperer le projet
+        uses: actions/checkout@v6
+
+      - name: Installer Python sur le runner GitHub
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dependances
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Construire l'executable autonome
+        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name SuiviClaquage app.py
+
+      - name: Publier le fichier executable a telecharger
+        uses: actions/upload-artifact@v7
+        with:
+          name: SuiviClaquage-Windows
+          path: dist/SuiviClaquage.exe
+          if-no-files-found: error
+          retention-days: 30
