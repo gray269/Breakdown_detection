@@ -20,9 +20,9 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 ## Comparaison des deux dossiers
 
-Dans le dossier 1, les sous-dossiers de premier niveau portent les numéros produit. Dans le dossier 2, un sous-dossier de regroupement précède les sous-dossiers par numéro produit. Le logiciel associe les produits à partir du nom du dossier numéro, sans tenir compte des majuscules/minuscules. Il cherche le motif configuré (par défaut `picture_2`) dans les images du produit. Les modules 16 mm et 18 mm sont regroupés : la taille n’entre pas dans le calcul.
+Dans le dossier 1, les sous-dossiers de premier niveau portent les numéros produit. Dans le dossier 2, les sous-dossiers de premier niveau portent les dates, puis viennent les sous-dossiers par numéro produit. Le dossier 2 peut être choisi à la racine des dates ou directement sur un dossier de date. Les dates de début et de fin filtrent les dossiers produit selon leur date de création Windows dans les deux sources, bornes incluses. Dans chaque dossier produit, l’application retient un seul fichier image dont le nom est exactement `picture_2` (la casse de l’extension et du nom est ignorée). Les numéros produit sont associés sans tenir compte des majuscules/minuscules. Les modules 16 mm et 18 mm sont regroupés.
 
-Pour calculer le taux « dossier 2 uniquement », le logiciel doit aussi analyser les images vertes des produits qui n’ont pas été détectés en gris. Les trois taux affichés utilisent le même dénominateur : le nombre de produits ayant une image analysable dans chacun des deux dossiers.
+Le dossier gris est analysé en premier. Le premier passage se fait à résolution réduite ; les images suspectes ou ambiguës sont ensuite vérifiées à la résolution de travail supérieure. Pour calculer le taux « dossier 2 uniquement », les images vertes des produits sans défaut gris passent elles aussi par ce tri rapide. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les trois taux utilisent le même dénominateur : les produits ayant une image `picture_2` exploitable dans chacun des deux dossiers pour l’intervalle choisi.
 
 - **T1 — Dossier 1 uniquement** : claquage détecté en gris, absent en vert.
 - **T2 — Présent dans les deux** : claquage détecté en gris et en vert.
@@ -36,7 +36,9 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 - Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre.
 - Surveillance périodique de deux dossiers facultatifs : images en niveaux de gris et images vertes.
 - Barre de progression pendant la recherche et l’analyse des images.
-- Parcours des sous-dossiers et recherche des fichiers dont le nom contient `picture_2`.
+- Analyse d’un seul fichier `picture_2` par produit dans l’intervalle choisi pour les deux sources.
+- Filtrage des dossiers produit par dates de début et de fin, d’après leur date de création.
+- Cache persistant des détections pour éviter de recalculer les images inchangées lors des scans suivants ou après redémarrage.
 - Détection des points sombres sur le disque lumineux, y compris près de sa périphérie.
 - Réglages de date, fréquence d’analyse, diamètre minimal du point et contraste.
 - Mode essai pour une ou plusieurs images, avec résultat et zone détectée entourée.
@@ -46,6 +48,6 @@ Les résultats sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`.
 
 ## Règle de calcul
 
-Les taux sont calculés sur les produits comparables pour la date sélectionnée, toutes tailles de module confondues. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur.
+Les taux sont calculés sur les produits comparables dont les dossiers produit ont été créés dans l’intervalle sélectionné, toutes tailles de module confondues. Les dossiers impossibles à analyser apparaissent « à vérifier » et ne sont pas inclus dans le dénominateur. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.

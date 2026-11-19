@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 APP_NAME = "SuiviClaquage"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
+QUICK_ANALYSIS_SIDE = 512
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
@@ -42,7 +43,8 @@ DEFAULT_CONFIG = {
     "folder_gray": "",
     "folder_green": "",
     "filename_pattern": "picture_2",
-    "analysis_date": date.today().isoformat(),
+    "analysis_start_date": date.today().isoformat(),
+    "analysis_end_date": date.today().isoformat(),
     "interval_seconds": 30,
     "min_spot_diameter_percent": 1.8,
     "contrast_ratio": 0.20,
@@ -57,6 +59,12 @@ def load_config() -> dict:
         if isinstance(saved, dict):
             config.update(saved)
             config.pop("size", None)
+            legacy_date = saved.get("analysis_date")
+            if "analysis_start_date" not in saved:
+                config["analysis_start_date"] = legacy_date or date.today().isoformat()
+            if "analysis_end_date" not in saved:
+                config["analysis_end_date"] = legacy_date or config["analysis_start_date"]
+            config.pop("analysis_date", None)
     except (OSError, json.JSONDecodeError):
         pass
     return config
@@ -141,6 +149,7 @@ def analyze_image(
     min_diameter_percent: float,
     contrast_ratio: float,
     annotate: bool = True,
+    max_side: int = MAX_ANALYSIS_SIDE,
 ) -> dict:
     """Look for a dark, connected spot inside a bright circular field."""
     with Image.open(path) as source:
@@ -149,7 +158,7 @@ def analyze_image(
         # Avoid copying a full-resolution TIFF/JPEG before reducing it for the
         # scan. The original is retained only for the interactive test window.
         work = source
-    work.thumbnail((MAX_ANALYSIS_SIDE, MAX_ANALYSIS_SIDE), Image.Resampling.LANCZOS)
+    work.thumbnail((max_side, max_side), Image.Resampling.BOX)
     work = work.convert("RGB")
     rgb = np.asarray(work, dtype=np.uint8)
 
@@ -306,16 +315,94 @@ def analyze_image(
     }
 
 
+def _date_folder_key(folder_name: str) -> str | None:
+    for date_format in ("%Y-%m-%d", "%Y%m%d", "%d-%m-%Y", "%d_%m_%Y", "%d.%m.%Y", "%Y_%m_%d"):
+        try:
+            return datetime.strptime(folder_name.strip(), date_format).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _folder_created_date(folder: Path) -> date | None:
+    """Read the folder creation date (st_birthtime where available, Windows ctime otherwise)."""
+    try:
+        stat = folder.stat()
+        timestamp = getattr(stat, "st_birthtime", None)
+        if timestamp is None:
+            timestamp = stat.st_ctime
+        return datetime.fromtimestamp(timestamp).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _picture_2_in(product_folder: Path, pattern: str) -> Path | None:
+    """Return one exact picture_2 file from the product folder, without walking deeper."""
+    extension_priority = {".tif": 0, ".tiff": 1, ".png": 2, ".jpg": 3, ".jpeg": 4, ".bmp": 5}
+    try:
+        candidates = [
+            item for item in product_folder.iterdir()
+            if item.is_file()
+            and item.suffix.casefold() in IMAGE_EXTENSIONS
+            and item.stem.strip().casefold() == pattern
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (extension_priority.get(item.suffix.casefold(), 99), item.name.casefold()))
+
+
 def scan_folders(config: dict, progress_callback=None) -> list[dict]:
+    min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
+    contrast_ratio = float(config.get("contrast_ratio", 0.20))
+    connection = sqlite3.connect(DATABASE_FILE)
+    try:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS image_analysis_cache (
+                path TEXT NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                min_diameter REAL NOT NULL,
+                contrast_ratio REAL NOT NULL,
+                max_side INTEGER NOT NULL,
+                detected INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                error_text TEXT NOT NULL,
+                PRIMARY KEY (path, modified_ns, file_size, min_diameter, contrast_ratio, max_side)
+            )
+        """)
+        rows = connection.execute("""
+            SELECT path, modified_ns, file_size, min_diameter, contrast_ratio,
+                   max_side, detected, mode, error_text
+            FROM image_analysis_cache
+            WHERE min_diameter=? AND contrast_ratio=?
+        """, (min_diameter, contrast_ratio)).fetchall()
+        with ANALYSIS_CACHE_LOCK:
+            for path, modified_ns, file_size, min_value, contrast_value, max_side, detected, mode, error_text in rows:
+                key = (path, modified_ns, file_size, min_value, contrast_value, max_side)
+                ANALYSIS_CACHE[key] = (bool(detected), mode, error_text)
+        connection.commit()
+        return _scan_folders_with_cache(config, progress_callback, connection)
+    finally:
+        connection.commit()
+        connection.close()
+
+
+def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: sqlite3.Connection) -> list[dict]:
+    """Scan exact picture_2 images only for product folders created in the selected interval."""
     groups: dict[str, dict] = {}
     pattern = str(config.get("filename_pattern", "picture_2")).strip().casefold()
-    roots = [
-        ("gray", str(config.get("folder_gray", "")).strip()),
-        ("green", str(config.get("folder_green", "")).strip()),
-    ]
+    start_date = datetime.strptime(config["analysis_start_date"], "%Y-%m-%d").date()
+    end_date = datetime.strptime(config["analysis_end_date"], "%Y-%m-%d").date()
     if progress_callback:
-        progress_callback({"phase": "search", "message": "Recherche des dossiers et des images…"})
-    discovered_folders = 0
+        progress_callback({
+            "phase": "search",
+            "message": f"Recherche des dossiers créés du {start_date:%d/%m/%Y} au {end_date:%d/%m/%Y}…",
+        })
+
+    roots = [("gray", str(config.get("folder_gray", "")).strip()),
+             ("green", str(config.get("folder_green", "")).strip())]
     for kind, root_text in roots:
         if not root_text:
             continue
@@ -323,147 +410,210 @@ def scan_folders(config: dict, progress_callback=None) -> list[dict]:
         if not root.is_dir():
             continue
         try:
-            top_level_folders = sorted(
-                (item for item in root.iterdir() if item.is_dir()),
-                key=lambda item: item.name.casefold(),
-            )
-            if kind == "green":
-                # Green-image export layout: root / grouping folder / product ID.
-                product_folders = []
-                for grouping_folder in top_level_folders:
-                    product_folders.extend(
-                        item for item in grouping_folder.iterdir() if item.is_dir()
+            top_folders = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold())
+            if kind == "gray":
+                product_folders = top_folders
+            else:
+                # Green layout can be either root/date/product or a selected
+                # date folder/product. The interval is determined by product
+                # folder creation time, not by the date folder's name.
+                root_date_key = _date_folder_key(root.name)
+                dated_children = [item for item in top_folders if _date_folder_key(item.name)]
+                if root_date_key is not None:
+                    product_folders = top_folders
+                elif dated_children:
+                    product_folders = []
+                    for date_folder in dated_children:
+                        product_folders.extend(
+                            item for item in date_folder.iterdir() if item.is_dir()
+                        )
+                    product_folders.sort(key=lambda item: item.name.casefold())
+                else:
+                    # Also handle date-folder labels that are not parseable as
+                    # a numeric date: a date/grouping folder contains product
+                    # directories, while a product folder contains image files.
+                    nested_folders = []
+                    for possible_date_folder in top_folders:
+                        nested_folders.extend(
+                            item for item in possible_date_folder.iterdir() if item.is_dir()
+                        )
+                    product_folders = sorted(
+                        nested_folders or top_folders,
+                        key=lambda item: item.name.casefold(),
                     )
-                product_folders.sort(key=lambda item: item.name.casefold())
-            else:
-                product_folders = top_level_folders
-            if product_folders:
-                for product_folder in product_folders:
-                    discovered_folders += 1
-                    if progress_callback and discovered_folders % 10 == 0:
-                        progress_callback({
-                            "phase": "search",
-                            "message": f"Recherche des images… {product_folder.name}",
-                        })
-                    product_name = product_folder.name.strip()
-                    if not product_name:
-                        continue
-                    product_key = product_name.casefold()
-                    entry = groups.setdefault(product_key, {
-                        "product_name": product_name, "gray": [], "green": [],
-                    })
-                    for file_path in product_folder.rglob("*"):
-                        if not file_path.is_file() or file_path.suffix.casefold() not in IMAGE_EXTENSIONS:
-                            continue
-                        if pattern and pattern not in file_path.stem.casefold():
-                            continue
-                        entry[kind].append(file_path)
-            else:
-                # Also accept a root containing images directly, although product
-                # subfolders are the expected structure.
-                entry = groups.setdefault(".", {
-                    "product_name": "Dossier racine", "gray": [], "green": [],
+            for product_folder in product_folders:
+                product_name = product_folder.name.strip()
+                if not product_name:
+                    continue
+                created_on = _folder_created_date(product_folder)
+                if created_on is None or not start_date <= created_on <= end_date:
+                    continue
+                product_key = product_name.casefold()
+                entry = groups.setdefault(product_key, {
+                    "product_name": product_name, "gray": None, "green": None,
                 })
-                for file_path in root.iterdir():
-                    if file_path.is_file() and file_path.suffix.casefold() in IMAGE_EXTENSIONS:
-                        if not pattern or pattern in file_path.stem.casefold():
-                            entry[kind].append(file_path)
+                image_path = _picture_2_in(product_folder, pattern)
+                if image_path is not None:
+                    entry[kind] = image_path
         except OSError:
             continue
 
-    results: list[dict] = []
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
-    total_images = sum(len(group[kind]) for group in groups.values() for kind in ("gray", "green"))
+    ordered_keys = sorted(groups, key=str.casefold)
+    total_images = sum(
+        int(groups[key]["gray"] is not None)
+        + int(groups[key]["green"] is not None and groups[key]["gray"] is not None)
+        for key in ordered_keys
+    )
+    processed_images = 0
     if progress_callback:
         progress_callback({"phase": "process", "done": 0, "total": total_images})
-    processed_images = 0
-    for group_key in sorted(groups, key=str.casefold):
-        group = groups[group_key]
-        states = {"gray": None, "green": None}
-        image_paths = {"gray": [], "green": []}
-        errors: list[str] = []
-        for kind in ("gray", "green"):
-            paths = group[kind]
-            if not paths:
-                continue
-            detected_any = False
-            valid_count = 0
-            for image_path in paths:
-                image_paths[kind].append(str(image_path))
-                try:
-                    stat = image_path.stat()
-                    cache_key = (
-                        str(image_path.resolve()), stat.st_mtime_ns, stat.st_size,
-                        min_diameter, contrast_ratio,
-                    )
-                    with ANALYSIS_CACHE_LOCK:
-                        cached = ANALYSIS_CACHE.get(cache_key)
-                    if cached is None:
-                        detection = analyze_image(image_path, min_diameter, contrast_ratio, annotate=False)
-                        cached = (bool(detection["detected"]), detection["mode"], detection["error"])
-                        # Cache both positive and negative results. Static images
-                        # with no usable disk would otherwise be decoded again on
-                        # every automatic refresh.
-                        with ANALYSIS_CACHE_LOCK:
-                            ANALYSIS_CACHE[cache_key] = cached
-                    if cached[2]:
-                        errors.append(f"{image_path.name}: {cached[2]}")
-                    else:
-                        valid_count += 1
-                        detected_any = detected_any or cached[0]
-                except Exception as exc:
-                    errors.append(f"{image_path.name}: {exc}")
-                finally:
-                    processed_images += 1
-                    if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
-                        progress_callback({
-                            "phase": "process",
-                            "done": processed_images,
-                            "total": total_images,
-                            "product": group["product_name"],
-                            "image": image_path.name,
-                        })
-            if detected_any:
-                states[kind] = True
-            elif valid_count == len(paths):
-                states[kind] = False
-            else:
-                states[kind] = None
 
-        comparable = states["gray"] is not None and states["green"] is not None
+    cache_writes = 0
+
+    def detect(image_path: Path, max_side: int) -> tuple[bool, str, str]:
+        nonlocal cache_writes
+        stat = image_path.stat()
+        resolved_path = str(image_path.resolve())
+        cache_key = (
+            resolved_path, stat.st_mtime_ns, stat.st_size,
+            min_diameter, contrast_ratio, max_side,
+        )
+        with ANALYSIS_CACHE_LOCK:
+            cached = ANALYSIS_CACHE.get(cache_key)
+        if cached is None:
+            detection = analyze_image(
+                image_path, min_diameter, contrast_ratio, annotate=False, max_side=max_side
+            )
+            cached = (bool(detection["detected"]), detection["mode"], detection["error"])
+            # Keep negative and unusable images cached too; automatic refreshes
+            # should not decode the same unchanged TIFFs over and over.
+            with ANALYSIS_CACHE_LOCK:
+                ANALYSIS_CACHE[cache_key] = cached
+            cache_connection.execute("""
+                INSERT OR REPLACE INTO image_analysis_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                resolved_path, stat.st_mtime_ns, stat.st_size,
+                min_diameter, contrast_ratio, max_side,
+                int(cached[0]), cached[1], cached[2],
+            ))
+            cache_writes += 1
+            if cache_writes % 100 == 0:
+                cache_connection.commit()
+        return cached
+
+    states = {key: {"gray": None, "green": None} for key in ordered_keys}
+    errors = {key: [] for key in ordered_keys}
+
+    # Complete the gray pass first. Use a quick image pass for likely negatives;
+    # analyze only positive or ambiguous candidates at the larger working size.
+    for key in ordered_keys:
+        image_path = groups[key]["gray"]
+        if image_path is None:
+            continue
+        gray_pass = "gris confirmé"
+        try:
+            detected, _mode, error = detect(image_path, QUICK_ANALYSIS_SIDE)
+            gray_pass = "gris rapide"
+            if detected or error:
+                detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
+                gray_pass = "gris confirmé"
+            if error:
+                errors[key].append(f"{image_path.name}: {error}")
+            else:
+                states[key]["gray"] = detected
+        except Exception as exc:
+            errors[key].append(f"{image_path.name}: {exc}")
+        processed_images += 1
+        if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
+            progress_callback({
+                "phase": "process", "done": processed_images, "total": total_images,
+                "product": groups[key]["product_name"], "source": gray_pass,
+            })
+
+    # Green images are limited to product folders created in the selected
+    # interval. Gray-negative products use a faster green-only first pass.
+    for key in ordered_keys:
+        image_path = groups[key]["green"]
+        if image_path is None:
+            continue
+        if states[key]["gray"] is None:
+            # Count this slot as skipped so the progress bar still reaches 100%
+            # without decoding green images that cannot be compared.
+            processed_images += 1
+            if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
+                progress_callback({
+                    "phase": "process", "done": processed_images, "total": total_images,
+                    "product": groups[key]["product_name"], "source": "vert ignoré",
+                })
+            continue
+        green_pass = "vert complet"
+        try:
+            if states[key]["gray"]:
+                detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
+                green_pass = "vert complet"
+            else:
+                detected, _mode, error = detect(image_path, QUICK_ANALYSIS_SIDE)
+                green_pass = "vert rapide"
+                if detected or error:
+                    detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
+                    green_pass = "vert confirmé"
+            if error:
+                errors[key].append(f"{image_path.name}: {error}")
+            else:
+                states[key]["green"] = detected
+        except Exception as exc:
+            errors[key].append(f"{image_path.name}: {exc}")
+        processed_images += 1
+        if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
+            progress_callback({
+                "phase": "process", "done": processed_images, "total": total_images,
+                "product": groups[key]["product_name"], "source": green_pass,
+            })
+
+    results: list[dict] = []
+    for key in ordered_keys:
+        group = groups[key]
+        gray_state, green_state = states[key]["gray"], states[key]["green"]
+        comparable = gray_state is not None and green_state is not None
         if not comparable:
             category = "À vérifier"
-        elif states["gray"] and states["green"]:
+        elif gray_state and green_state:
             category = "Présent dans les deux"
-        elif states["gray"]:
+        elif gray_state:
             category = "Dossier 1 uniquement"
-        elif states["green"]:
+        elif green_state:
             category = "Dossier 2 uniquement"
         else:
             category = "Aucun claquage"
         results.append({
-            "group_key": group_key,
+            "group_key": key,
             "display_name": group["product_name"],
-            "gray_state": states["gray"],
-            "green_state": states["green"],
+            "gray_state": gray_state,
+            "green_state": green_state,
             "category": category,
             "comparable": comparable,
-            "image_paths": image_paths,
-            "errors": errors,
+            "image_paths": {
+                "gray": [str(group["gray"])] if group["gray"] else [],
+                "green": [str(group["green"])] if group["green"] else [],
+            },
+            "errors": errors[key],
         })
     if progress_callback:
-        progress_callback({"phase": "save", "done": total_images, "total": total_images})
+        progress_callback({"phase": "save", "done": processed_images, "total": total_images})
     return results
 
 
 def save_results(results: list[dict], config: dict) -> tuple[int, int]:
-    analysis_date = str(config["analysis_date"])
+    start_date = str(config["analysis_start_date"])
+    end_date = str(config["analysis_end_date"])
     scanned_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DATABASE_FILE) as connection:
         connection.execute("""
-            CREATE TABLE IF NOT EXISTS comparisons_all_sizes (
-                analysis_date TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS comparisons_intervals (
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
                 product_key TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 gray_state TEXT NOT NULL,
@@ -473,20 +623,20 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
                 image_paths TEXT NOT NULL,
                 error_text TEXT NOT NULL,
                 scanned_at TEXT NOT NULL,
-                PRIMARY KEY (analysis_date, product_key)
+                PRIMARY KEY (start_date, end_date, product_key)
             )
         """)
         connection.execute(
-            "DELETE FROM comparisons_all_sizes WHERE analysis_date=?",
-            (analysis_date,),
+            "DELETE FROM comparisons_intervals WHERE start_date=? AND end_date=?",
+            (start_date, end_date),
         )
         for row in results:
             gray_state = "oui" if row["gray_state"] is True else "non" if row["gray_state"] is False else "—"
             green_state = "oui" if row["green_state"] is True else "non" if row["green_state"] is False else "—"
             connection.execute("""
-                INSERT INTO comparisons_all_sizes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO comparisons_intervals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                analysis_date, row["group_key"], row["display_name"],
+                start_date, end_date, row["group_key"], row["display_name"],
                 gray_state, green_state, row["category"], int(row["comparable"]),
                 json.dumps(row["image_paths"], ensure_ascii=False),
                 " | ".join(row["errors"]), scanned_at,
@@ -496,14 +646,14 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
     return total, with_defect
 
 
-def read_current_results(analysis_date: str) -> list[tuple]:
+def read_current_results(start_date: str, end_date: str) -> list[tuple]:
     if not DATABASE_FILE.exists():
         return []
     try:
         with sqlite3.connect(DATABASE_FILE) as connection:
             return connection.execute("""
                 SELECT display_name, gray_state, green_state, category, comparable, error_text
-                FROM comparisons_all_sizes WHERE analysis_date=?
+                FROM comparisons_intervals WHERE start_date=? AND end_date=?
                 ORDER BY CASE category
                     WHEN 'Dossier 1 uniquement' THEN 1
                     WHEN 'Présent dans les deux' THEN 2
@@ -511,7 +661,7 @@ def read_current_results(analysis_date: str) -> list[tuple]:
                     WHEN 'Aucun claquage' THEN 4
                     ELSE 5 END,
                     display_name COLLATE NOCASE
-            """, (analysis_date,)).fetchall()
+            """, (start_date, end_date)).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).casefold():
             return []
@@ -590,7 +740,8 @@ class SettingsWindow:
         self.folder_gray = StringVar(value=app.config.get("folder_gray", ""))
         self.folder_green = StringVar(value=app.config.get("folder_green", ""))
         self.pattern = StringVar(value=app.config.get("filename_pattern", "picture_2"))
-        self.analysis_date = StringVar(value=app.config.get("analysis_date", date.today().isoformat()))
+        self.analysis_start_date = StringVar(value=app.config.get("analysis_start_date", date.today().isoformat()))
+        self.analysis_end_date = StringVar(value=app.config.get("analysis_end_date", date.today().isoformat()))
         self.interval = StringVar(value=str(app.config.get("interval_seconds", 30)))
         self.min_diameter = StringVar(value=str(app.config.get("min_spot_diameter_percent", 1.8)))
         self.contrast = StringVar(value=str(app.config.get("contrast_ratio", 0.20)))
@@ -600,7 +751,7 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient un niveau de regroupement supplémentaire, puis les sous-dossiers par numéro produit. Le logiciel associe les deux images avec le même numéro.",
+            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient les sous-dossiers par date, puis par numéro produit. La période sélectionnée filtre les dossiers produit selon leur date de création dans les deux sources. Dans chaque dossier produit, seule l’image nommée exactement picture_2 est retenue.",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
@@ -609,13 +760,15 @@ class SettingsWindow:
         self._folder_row(folders, "Dossier 1 — images grises", self.folder_gray, 0)
         self._folder_row(folders, "Dossier 2 — images vertes", self.folder_green, 1)
 
-        metadata = ttk.LabelFrame(body, text="Données du contrôle", padding=10)
+        metadata = ttk.LabelFrame(body, text="Période et image à analyser", padding=10)
         metadata.pack(fill="x", pady=5)
-        ttk.Label(metadata, text="Date (AAAA-MM-JJ)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(metadata, textvariable=self.analysis_date, width=18).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(metadata, text="Motif du nom de l’image").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(metadata, text="Du (AAAA-MM-JJ)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(metadata, textvariable=self.analysis_start_date, width=16).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(metadata, text="Au (AAAA-MM-JJ)").grid(row=0, column=2, sticky="w", padx=(20, 5), pady=5)
+        ttk.Entry(metadata, textvariable=self.analysis_end_date, width=16).grid(row=0, column=3, sticky="w", padx=5, pady=5)
+        ttk.Label(metadata, text="Nom exact de l’image").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(metadata, textvariable=self.pattern, width=20).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(metadata, text="Exemple : picture_2 · tailles 16 et 18 mm regroupées").grid(row=1, column=2, columnspan=2, sticky="w", padx=5, pady=5)
+        ttk.Label(metadata, text="Nom exact : picture_2 · toutes tailles regroupées").grid(row=1, column=2, columnspan=2, sticky="w", padx=5, pady=5)
 
         detection = ttk.LabelFrame(body, text="Réglage de détection", padding=10)
         detection.pack(fill="x", pady=5)
@@ -633,7 +786,7 @@ class SettingsWindow:
 
         note = ttk.Label(
             body,
-            text="Pour calculer le taux « dossier 2 uniquement », les images vertes sont aussi analysées pour les numéros sans claquage gris. Un produit n’entre dans les taux que si les deux images ont pu être analysées. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
+            text="Les dates filtrent la date de création des dossiers produit dans les deux sources. Pour calculer le taux « dossier 2 uniquement », les images vertes des produits sans défaut gris passent par un tri rapide. Les détections sont conservées localement et réutilisées si le fichier et les réglages n’ont pas changé. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
             wraplength=730,
         )
         note.pack(anchor="w", pady=10)
@@ -660,7 +813,10 @@ class SettingsWindow:
 
     def values(self) -> dict | None:
         try:
-            datetime.strptime(self.analysis_date.get().strip(), "%Y-%m-%d")
+            start_date = datetime.strptime(self.analysis_start_date.get().strip(), "%Y-%m-%d").date()
+            end_date = datetime.strptime(self.analysis_end_date.get().strip(), "%Y-%m-%d").date()
+            if start_date > end_date:
+                raise ValueError("La date de début doit être antérieure ou égale à la date de fin.")
             min_diameter = float(self.min_diameter.get().replace(",", "."))
             contrast = float(self.contrast.get().replace(",", "."))
             interval = int(self.interval.get())
@@ -677,7 +833,8 @@ class SettingsWindow:
             "folder_gray": self.folder_gray.get().strip(),
             "folder_green": self.folder_green.get().strip(),
             "filename_pattern": self.pattern.get().strip(),
-            "analysis_date": self.analysis_date.get().strip(),
+            "analysis_start_date": self.analysis_start_date.get().strip(),
+            "analysis_end_date": self.analysis_end_date.get().strip(),
             "interval_seconds": interval,
             "min_spot_diameter_percent": min_diameter,
             "contrast_ratio": contrast,
@@ -880,7 +1037,7 @@ class MonitorApp:
                     self.progress_text_var.set("Calcul des taux…")
                 elif total:
                     self.progress_text_var.set(
-                        f"{done}/{total} images · {latest.get('product', '')}"
+                        f"{done}/{total} · {latest.get('source', '')} · {latest.get('product', '')}"
                     )
                 else:
                     self.progress_text_var.set("Aucune image trouvée")
@@ -909,22 +1066,23 @@ class MonitorApp:
             return
         self.refresh_summary()
         if not results:
-            self.progress_text_var.set("Aucune image trouvée")
-            self.status_var.set("Aucune image correspondant au motif")
+            self.progress_text_var.set("Aucun dossier dans l’intervalle")
+            self.status_var.set("Aucun dossier produit créé pendant cette période")
         elif total == 0:
             gray_products = sum(bool(row["image_paths"]["gray"]) for row in results)
             green_products = sum(bool(row["image_paths"]["green"]) for row in results)
             self.progress_text_var.set(
                 f"0 paire exploitable · gris {gray_products} / vert {green_products}"
             )
-            self.status_var.set("Vérifier les numéros produit, le motif et la qualité des images")
+            self.status_var.set("Vérifier les dates, numéros produit et la présence de picture_2")
         else:
             self.progress_text_var.set(f"Analyse terminée · {sum(len(row['image_paths']['gray']) + len(row['image_paths']['green']) for row in results)} images")
             self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
 
     def refresh_summary(self) -> None:
-        analysis_date = str(self.config.get("analysis_date", date.today().isoformat()))
-        rows = read_current_results(analysis_date)
+        start_date = str(self.config.get("analysis_start_date", date.today().isoformat()))
+        end_date = str(self.config.get("analysis_end_date", start_date))
+        rows = read_current_results(start_date, end_date)
         comparable_rows = [row for row in rows if row[4]]
         total = len(comparable_rows)
         category_counts = {
@@ -943,7 +1101,7 @@ class MonitorApp:
                 self.rate_vars[category].set("— %")
                 self.rate_count_vars[category].set("0 / 0 produit")
             self.count_var.set("Aucun produit analysable dans les deux dossiers")
-        self.filter_var.set(f"{analysis_date} · toutes tailles de module")
+        self.filter_var.set(f"{start_date} → {end_date} · toutes tailles de module")
         for item in self.table.get_children():
             self.table.delete(item)
         tags = {
@@ -991,13 +1149,13 @@ class MonitorApp:
         try:
             with sqlite3.connect(DATABASE_FILE) as connection:
                 rows = connection.execute("""
-                    SELECT analysis_date, display_name, gray_state, green_state,
+                    SELECT start_date, end_date, display_name, gray_state, green_state,
                            category, comparable, image_paths, error_text, scanned_at
-                    FROM comparisons_all_sizes ORDER BY analysis_date DESC, display_name COLLATE NOCASE
+                    FROM comparisons_intervals ORDER BY start_date DESC, end_date DESC, display_name COLLATE NOCASE
                 """).fetchall()
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
-                writer.writerow(("Date", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
+                writer.writerow(("Début", "Fin", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
                 writer.writerows(rows)
             self.status_var.set("Rapport CSV exporté")
         except Exception as exc:
