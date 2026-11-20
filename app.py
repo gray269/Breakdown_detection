@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
@@ -20,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
-APP_VERSION = "2026.11.19-diagnostic"
+APP_VERSION = "2026.11.20-archives"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
@@ -80,6 +81,7 @@ class AnalysisLogger:
 DEFAULT_CONFIG = {
     "folder_gray": "",
     "folder_green": "",
+    "results_folder": "",
     "filename_pattern": "picture_2",
     "analysis_start_date": date.today().isoformat(),
     "analysis_end_date": date.today().isoformat(),
@@ -816,6 +818,114 @@ def read_current_results(start_date: str, end_date: str) -> list[tuple]:
         raise
 
 
+def read_archive_rows(start_date: str, end_date: str) -> list[tuple]:
+    """Read source states and paths for archive generation for one interval."""
+    if not DATABASE_FILE.exists():
+        return []
+    try:
+        with sqlite3.connect(DATABASE_FILE) as connection:
+            return connection.execute("""
+                SELECT display_name, gray_state, green_state, image_paths
+                FROM comparisons_intervals
+                WHERE start_date=? AND end_date=?
+                ORDER BY display_name COLLATE NOCASE
+            """, (start_date, end_date)).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).casefold():
+            return []
+        raise
+
+
+ARCHIVE_CATEGORIES = {
+    "Dossier 1 uniquement": "T1_Dossier1_uniquement.zip",
+    "Présent dans les deux": "T2_Present_dans_les_deux.zip",
+    "Dossier 2 uniquement": "T3_Dossier2_uniquement.zip",
+}
+
+
+def create_category_archives(
+    start_date: str,
+    end_date: str,
+    destination_root: str | Path,
+    progress_callback=None,
+) -> tuple[Path, dict[str, int], list[str]]:
+    """Create one ZIP per comparable defect category, each with gray and green images."""
+    rows = read_archive_rows(start_date, end_date)
+    categorized: dict[str, list[tuple[str, dict[str, list[str]]]]] = {
+        category: [] for category in ARCHIVE_CATEGORIES
+    }
+    errors: list[str] = []
+    for display_name, gray_label, green_label, paths_json in rows:
+        gray_state = {"oui": True, "non": False}.get(gray_label)
+        green_state = {"oui": True, "non": False}.get(green_label)
+        category = _classify_states(gray_state, green_state)
+        if category not in categorized:
+            continue
+        try:
+            image_paths = json.loads(paths_json)
+            gray_paths = image_paths.get("gray", [])
+            green_paths = image_paths.get("green", [])
+            if not gray_paths or not green_paths:
+                errors.append(f"{category} | {display_name} | image grise ou verte absente du résultat")
+                continue
+            categorized[category].append((display_name, {
+                "gray": [str(gray_paths[0])],
+                "green": [str(green_paths[0])],
+            }))
+        except (json.JSONDecodeError, TypeError, AttributeError, IndexError) as exc:
+            errors.append(f"{category} | {display_name} | chemins illisibles : {_exception_description(exc)}")
+            continue
+
+    root = Path(destination_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_directory = root / f"Resultats_claquage_{start_date}_{end_date}_{stamp}"
+    output_directory.mkdir()
+
+    total_products = sum(len(products) for products in categorized.values())
+    processed = 0
+    counts = {category: 0 for category in ARCHIVE_CATEGORIES}
+    for category, archive_name in ARCHIVE_CATEGORIES.items():
+        archive_path = output_directory / archive_name
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            archive.writestr(
+                "Lisez-moi.txt",
+                f"Catégorie : {category}\nPériode : {start_date} au {end_date}\n"
+                "Chaque dossier produit contient l’image grise et l’image verte picture_2.\n",
+            )
+            for product_name, image_paths in categorized[category]:
+                processed += 1
+                try:
+                    gray_path = Path(image_paths["gray"][0])
+                    green_path = Path(image_paths["green"][0])
+                    gray_bytes = gray_path.read_bytes()
+                    green_bytes = green_path.read_bytes()
+                    product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "produit_inconnu"
+                    archive.writestr(f"{product_folder}/gris_{gray_path.name}", gray_bytes)
+                    archive.writestr(f"{product_folder}/vert_{green_path.name}", green_bytes)
+                    counts[category] += 1
+                except (OSError, ValueError) as exc:
+                    detail = f"{category} | {product_name} | {_exception_description(exc)}"
+                    errors.append(detail)
+                if progress_callback:
+                    progress_callback({
+                        "phase": "archive", "done": processed, "total": total_products,
+                        "product": product_name, "category": category,
+                    })
+
+    summary_lines = [
+        f"Période : {start_date} au {end_date}",
+        f"Dossier de résultats : {output_directory}",
+        "",
+    ]
+    summary_lines.extend(f"{category} : {counts[category]} produit(s)" for category in ARCHIVE_CATEGORIES)
+    summary_lines.extend(["", f"Erreurs de copie : {len(errors)}"])
+    if errors:
+        summary_lines.extend(errors)
+    (output_directory / "resume_archivage.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+    return output_directory, counts, errors
+
+
 class ImageTestWindow:
     def __init__(self, parent: Tk | Toplevel, paths: tuple[str, ...], min_diameter: float, contrast: float):
         self.window = Toplevel(parent)
@@ -879,14 +989,15 @@ class SettingsWindow:
         self.app = app
         self.window = Toplevel(app.root)
         self.window.title("Paramètres de surveillance")
-        self.window.geometry("780x670")
-        self.window.minsize(700, 600)
+        self.window.geometry("780x730")
+        self.window.minsize(700, 640)
         self.window.transient(app.root)
         self.window.grab_set()
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.folder_gray = StringVar(value=app.config.get("folder_gray", ""))
         self.folder_green = StringVar(value=app.config.get("folder_green", ""))
+        self.results_folder = StringVar(value=app.config.get("results_folder", ""))
         self.pattern = StringVar(value=app.config.get("filename_pattern", "picture_2"))
         self.analysis_start_date = StringVar(value=app.config.get("analysis_start_date", date.today().isoformat()))
         self.analysis_end_date = StringVar(value=app.config.get("analysis_end_date", date.today().isoformat()))
@@ -907,6 +1018,15 @@ class SettingsWindow:
         folders.pack(fill="x", pady=5)
         self._folder_row(folders, "Dossier 1 — images grises", self.folder_gray, 0)
         self._folder_row(folders, "Dossier 2 — images vertes", self.folder_green, 1)
+
+        results = ttk.LabelFrame(body, text="Export des résultats en archives ZIP", padding=10)
+        results.pack(fill="x", pady=5)
+        self._folder_row(results, "Dossier de destination", self.results_folder, 0)
+        ttk.Label(
+            results,
+            text="Le bouton « Archives » créera un sous-dossier daté avec un ZIP par catégorie T1, T2 et T3.",
+            foreground="#555555",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
 
         metadata = ttk.LabelFrame(body, text="Période et image à analyser", padding=10)
         metadata.pack(fill="x", pady=5)
@@ -980,6 +1100,7 @@ class SettingsWindow:
         return {
             "folder_gray": self.folder_gray.get().strip(),
             "folder_green": self.folder_green.get().strip(),
+            "results_folder": self.results_folder.get().strip(),
             "filename_pattern": self.pattern.get().strip(),
             "analysis_start_date": self.analysis_start_date.get().strip(),
             "analysis_end_date": self.analysis_end_date.get().strip(),
@@ -1034,6 +1155,8 @@ class MonitorApp:
         self.config = load_config()
         self.settings_window: SettingsWindow | None = None
         self.scan_running = False
+        self.archive_running = False
+        self.last_scan_signature: tuple | None = None
         self.progress_queue: queue.Queue = queue.Queue()
         self.progress_mode = "determinate"
         self.next_scan_id: str | None = None
@@ -1118,6 +1241,7 @@ class MonitorApp:
         ttk.Button(buttons, text="Réouvrir les paramètres", command=self.open_settings).pack(side="left")
         ttk.Button(buttons, text="Analyser", command=self.scan_now).pack(side="left", padx=6)
         ttk.Button(buttons, text="CSV", command=self.export_csv).pack(side="left")
+        ttk.Button(buttons, text="Archives", command=self.create_archives).pack(side="left", padx=6)
         ttk.Button(buttons, text="Journal", command=self.open_diagnostics).pack(side="left", padx=6)
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
 
@@ -1151,6 +1275,9 @@ class MonitorApp:
             pass
 
     def scan_now(self) -> None:
+        if self.archive_running:
+            self.status_var.set("Création des archives en cours…")
+            return
         if self.scan_running:
             self.status_var.set("Analyse déjà en cours…")
             return
@@ -1175,6 +1302,7 @@ class MonitorApp:
             except queue.Empty:
                 break
         self.scan_running = True
+        self.last_scan_signature = None
         self.status_var.set("Analyse en cours…")
         self.progress_text_var.set("Recherche des images…")
         self.progress_bar.configure(mode="indeterminate", maximum=100, value=0)
@@ -1226,7 +1354,18 @@ class MonitorApp:
                     )
                 else:
                     self.progress_text_var.set("Aucune image trouvée")
-        if self.scan_running:
+            elif phase == "archive":
+                if self.progress_mode != "determinate":
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="determinate")
+                    self.progress_mode = "determinate"
+                total = int(latest.get("total", 0))
+                done = int(latest.get("done", 0))
+                self.progress_bar.configure(maximum=max(1, total), value=done)
+                self.progress_text_var.set(
+                    f"ZIP {done}/{total} · {latest.get('category', '')} · {latest.get('product', '')}"
+                )
+        if self.scan_running or self.archive_running:
             self.root.after(100, self._poll_progress)
 
     def _scan_worker(self, config: dict) -> None:
@@ -1248,6 +1387,7 @@ class MonitorApp:
             )
             results = scan_folders(config, progress_callback=self.progress_queue.put, logger=logger)
             total, defects = save_results(results, config)
+            self.last_scan_signature = self._analysis_signature(config)
             duration = time.monotonic() - started
             logger.write(
                 f"RUN_FINISHED | résultat_enregistré | durée_secondes={duration:.2f} | "
@@ -1312,6 +1452,136 @@ class MonitorApp:
                 self.status_var.set("Aucune image analysable · vérifier l’accès aux fichiers et les dates")
             else:
                 self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
+
+    def create_archives(self) -> None:
+        if self.scan_running:
+            self.status_var.set("Attends la fin de l’analyse avant de créer les archives")
+            return
+        if self.archive_running:
+            self.status_var.set("Création des archives déjà en cours…")
+            return
+        destination = str(self.config.get("results_folder", "")).strip()
+        if not destination:
+            self.status_var.set("Choisis un dossier de destination dans les paramètres")
+            self.open_settings()
+            return
+        start_date = str(self.config.get("analysis_start_date", ""))
+        end_date = str(self.config.get("analysis_end_date", ""))
+        if self.last_scan_signature != self._analysis_signature(self.config):
+            messagebox.showinfo(
+                "Analyse nécessaire",
+                "Lance une analyse avec les paramètres actuels avant de créer les archives. Cela évite d’archiver les résultats d’un ancien dossier ou d’une ancienne période.",
+                parent=self.root,
+            )
+            return
+        try:
+            if not read_archive_rows(start_date, end_date):
+                messagebox.showinfo(
+                    "Aucun résultat",
+                    "Aucun résultat enregistré pour cette période. Lance d’abord une analyse.",
+                    parent=self.root,
+                )
+                return
+        except Exception as exc:
+            messagebox.showerror("Lecture des résultats impossible", _exception_description(exc), parent=self.root)
+            return
+
+        while True:
+            try:
+                self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.archive_running = True
+        self.status_var.set("Création des ZIP par catégorie…")
+        self.progress_text_var.set("Préparation des images à archiver…")
+        self.progress_bar.configure(mode="indeterminate", maximum=100, value=0)
+        self.progress_bar.start(12)
+        worker = threading.Thread(
+            target=self._archive_worker,
+            args=(start_date, end_date, destination),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(100, self._poll_progress)
+
+    @staticmethod
+    def _analysis_signature(config: dict) -> tuple:
+        return (
+            str(config.get("folder_gray", "")).strip(),
+            str(config.get("folder_green", "")).strip(),
+            str(config.get("filename_pattern", "picture_2")).strip().casefold(),
+            str(config.get("analysis_start_date", "")),
+            str(config.get("analysis_end_date", "")),
+            float(config.get("min_spot_diameter_percent", 1.8)),
+            float(config.get("contrast_ratio", 0.20)),
+        )
+
+    def _archive_worker(self, start_date: str, end_date: str, destination: str) -> None:
+        try:
+            output_directory, counts, errors = create_category_archives(
+                start_date, end_date, destination,
+                progress_callback=self.progress_queue.put,
+            )
+            self.root.after(
+                0,
+                lambda: self._archive_finished(output_directory, counts, errors, ""),
+            )
+        except Exception as exc:
+            message = _exception_description(exc)
+            logger = None
+            log_path = None
+            try:
+                logger = AnalysisLogger()
+                logger.write_exception(f"ARCHIVE_FATAL | {message}")
+                log_path = logger.path
+                self.latest_log_path = log_path
+            except Exception:
+                pass
+            finally:
+                if logger:
+                    logger.close()
+            self.root.after(
+                0,
+                lambda: self._archive_finished(None, {}, [], message, log_path),
+            )
+
+    def _archive_finished(
+        self,
+        output_directory: Path | None,
+        counts: dict[str, int],
+        errors: list[str],
+        error: str,
+        log_path: Path | None = None,
+    ) -> None:
+        self.archive_running = False
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate", maximum=1, value=0 if error else 1)
+        self.progress_mode = "determinate"
+        if log_path:
+            self.latest_log_path = log_path
+        if error:
+            self.progress_text_var.set("Échec de la création des archives")
+            self.status_var.set("Erreur pendant la création des ZIP · ouvrir Journal")
+            message = error + (f"\n\nJournal : {log_path}" if log_path else "")
+            messagebox.showerror("Création des archives impossible", message, parent=self.root)
+            return
+        total = sum(counts.values())
+        self.progress_text_var.set(f"Archives créées · {total} produit(s)")
+        if errors:
+            self.status_var.set(f"{len(errors)} copie(s) impossible(s) · détails dans resume_archivage.txt")
+        else:
+            self.status_var.set("Archives créées sans erreur")
+        summary = "\n".join(
+            f"{category} : {counts.get(category, 0)} produit(s)"
+            for category in ARCHIVE_CATEGORIES
+        )
+        if errors:
+            summary += f"\n\n{len(errors)} image(s) n’ont pas pu être copiées. Voir resume_archivage.txt."
+        messagebox.showinfo(
+            "Archives prêtes",
+            f"Les archives ont été créées dans :\n{output_directory}\n\n{summary}",
+            parent=self.root,
+        )
 
     def refresh_summary(self) -> None:
         start_date = str(self.config.get("analysis_start_date", date.today().isoformat()))

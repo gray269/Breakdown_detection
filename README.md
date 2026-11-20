@@ -44,8 +44,11 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 - Mode essai pour une ou plusieurs images, avec résultat et zone détectée entourée.
 - Export de l’historique en CSV.
 - Bouton `Journal` : affiche et exporte le journal de la dernière analyse, avec les erreurs détaillées et leurs traces techniques.
+- Choix d’un dossier de destination dans les paramètres, puis bouton `Archives` pour créer les résultats ZIP de la période sélectionnée.
 
-Les résultats et les journaux (30 derniers scans) sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`. Le journal contient les chemins des dossiers et numéros produit ainsi que les détails d’erreur, mais aucune image. Les images de production ne sont pas incluses dans ce projet : l’application analyse les dossiers locaux et ne téléverse pas les images vers GitHub.
+L’export crée un sous-dossier daté dans le dossier de destination, contenant trois archives : `T1_Dossier1_uniquement.zip`, `T2_Present_dans_les_deux.zip` et `T3_Dossier2_uniquement.zip`. Chaque archive contient un dossier par numéro produit avec les deux fichiers `picture_2`, préfixés `gris_` et `vert_`. Seuls les produits comparables classés T1/T2/T3 sont inclus ; les lignes « À vérifier » et les produits sans détection ne sont pas archivés. Le fichier `resume_archivage.txt` indique le nombre de produits par catégorie et les éventuelles images qui n’ont pas pu être copiées.
+
+Les résultats et les journaux (30 derniers scans) sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`. Le journal contient les chemins des dossiers et numéros produit ainsi que les détails d’erreur, mais aucune image. Les images de production ne sont pas incluses dans le dépôt GitHub : l’application analyse les dossiers locaux et ne téléverse pas les images vers GitHub. Les archives créées sont écrites uniquement dans le dossier de destination choisi.
 
 ## Règle de calcul
 
