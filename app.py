@@ -6,18 +6,21 @@ import math
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import threading
 import time
+import traceback
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
+from tkinter import BooleanVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
+APP_VERSION = "2026.11.19-diagnostic"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
@@ -37,6 +40,41 @@ def data_directory() -> Path:
 DATA_DIR = data_directory()
 CONFIG_FILE = DATA_DIR / "parametres.json"
 DATABASE_FILE = DATA_DIR / "historique.sqlite3"
+LOG_DIRECTORY = DATA_DIR / "logs"
+
+
+class AnalysisLogger:
+    """Write one flushed, human-readable diagnostic log for each scan."""
+
+    def __init__(self) -> None:
+        LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.path = LOG_DIRECTORY / f"analyse_{stamp}.log"
+        self._stream = self.path.open("w", encoding="utf-8", newline="\n")
+        self._lock = threading.Lock()
+        self.write(f"APPLICATION | version={APP_VERSION}")
+        self.write("Démarrage du journal d’analyse")
+        old_logs = sorted(LOG_DIRECTORY.glob("analyse_*.log"), key=lambda item: item.name, reverse=True)
+        for obsolete in old_logs[30:]:
+            try:
+                obsolete.unlink()
+            except OSError:
+                pass
+
+    def write(self, message: str) -> None:
+        timestamp = datetime.now().isoformat(timespec="milliseconds")
+        with self._lock:
+            self._stream.write(f"{timestamp} | {message.rstrip()}\n")
+            self._stream.flush()
+
+    def write_exception(self, message: str) -> None:
+        self.write(f"{message}\n{traceback.format_exc().rstrip()}")
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._stream.closed:
+                self._stream.flush()
+                self._stream.close()
 
 
 DEFAULT_CONFIG = {
@@ -337,7 +375,9 @@ def _exception_description(exc: Exception) -> str:
 
 
 def _classify_states(gray_state: bool | None, green_state: bool | None) -> str:
-    """Classify positive detections, including products with only one usable image."""
+    """Compare a product only when both image analyses produced a result."""
+    if gray_state is None or green_state is None:
+        return "À vérifier"
     if gray_state is True and green_state is True:
         return "Présent dans les deux"
     if gray_state is True:
@@ -378,7 +418,7 @@ def _picture_2_in(product_folder: Path, pattern: str) -> Path | None:
     return min(candidates, key=lambda item: (extension_priority.get(item.suffix.casefold(), 99), item.name.casefold()))
 
 
-def scan_folders(config: dict, progress_callback=None) -> list[dict]:
+def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | None = None) -> list[dict]:
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
     connection = sqlite3.connect(DATABASE_FILE)
@@ -408,13 +448,18 @@ def scan_folders(config: dict, progress_callback=None) -> list[dict]:
                 key = (path, modified_ns, file_size, min_value, contrast_value, max_side)
                 ANALYSIS_CACHE[key] = (bool(detected), mode, error_text)
         connection.commit()
-        return _scan_folders_with_cache(config, progress_callback, connection)
+        return _scan_folders_with_cache(config, progress_callback, connection, logger)
     finally:
         connection.commit()
         connection.close()
 
 
-def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: sqlite3.Connection) -> list[dict]:
+def _scan_folders_with_cache(
+    config: dict,
+    progress_callback,
+    cache_connection: sqlite3.Connection,
+    logger: AnalysisLogger | None = None,
+) -> list[dict]:
     """Scan exact picture_2 images for product/date folders in the selected interval."""
     groups: dict[str, dict] = {}
     pattern = str(config.get("filename_pattern", "picture_2")).strip().casefold()
@@ -428,13 +473,23 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
 
     roots = [("gray", str(config.get("folder_gray", "")).strip()),
              ("green", str(config.get("folder_green", "")).strip())]
+    discovery = {
+        "gray": {"folders": 0, "in_interval": 0, "missing_date": 0, "outside_interval": 0, "images": 0},
+        "green": {"folders": 0, "in_interval": 0, "missing_date": 0, "outside_interval": 0, "images": 0},
+    }
     for kind, root_text in roots:
         if not root_text:
+            if logger:
+                logger.write(f"SOURCE_SEARCH | source={kind} | ignorée: aucun dossier configuré")
             continue
         root = Path(root_text).expanduser()
         if not root.is_dir():
+            if logger:
+                logger.write(f"SOURCE_SEARCH_ERROR | source={kind} | dossier inexistant ou inaccessible: {root}")
             continue
         try:
+            if logger:
+                logger.write(f"SOURCE_SEARCH | source={kind} | racine={root}")
             top_folders = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold())
             if kind == "gray":
                 product_folders = [(item, None) for item in top_folders]
@@ -482,6 +537,7 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                 item[0].name.casefold(),
             ))
             folder_total = len(product_folders)
+            discovery[kind]["folders"] += folder_total
             for folder_index, (product_folder, date_from_parent) in enumerate(product_folders, start=1):
                 if progress_callback and (folder_index == 1 or folder_index % 50 == 0 or folder_index == folder_total):
                     progress_callback({
@@ -492,8 +548,13 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                 if not product_name:
                     continue
                 created_on = date_from_parent or _folder_created_date(product_folder)
-                if created_on is None or not start_date <= created_on <= end_date:
+                if created_on is None:
+                    discovery[kind]["missing_date"] += 1
                     continue
+                if not start_date <= created_on <= end_date:
+                    discovery[kind]["outside_interval"] += 1
+                    continue
+                discovery[kind]["in_interval"] += 1
                 canonical_name = _canonical_product_name(product_name)
                 product_key = canonical_name.casefold()
                 entry = groups.setdefault(product_key, {
@@ -502,15 +563,25 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                 image_path = _picture_2_in(product_folder, pattern)
                 if image_path is not None and entry[kind] is None:
                     entry[kind] = image_path
+                    discovery[kind]["images"] += 1
         except OSError:
+            if logger:
+                logger.write_exception(f"SOURCE_SEARCH_ERROR | source={kind} | racine={root}")
             continue
+        if logger:
+            summary = discovery[kind]
+            logger.write(
+                f"SOURCE_SEARCH_SUMMARY | source={kind} | dossiers={summary['folders']} | "
+                f"dans_intervalle={summary['in_interval']} | dates_absentes={summary['missing_date']} | "
+                f"hors_intervalle={summary['outside_interval']} | picture_2_trouvées={summary['images']}"
+            )
 
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
     ordered_keys = sorted(groups, key=str.casefold)
     total_images = sum(
         int(groups[key]["gray"] is not None)
-        + int(groups[key]["green"] is not None and groups[key]["gray"] is not None)
+        + int(groups[key]["green"] is not None)
         for key in ordered_keys
     )
     processed_images = 0
@@ -518,9 +589,11 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
         progress_callback({"phase": "process", "done": 0, "total": total_images})
 
     cache_writes = 0
+    cache_hits = 0
+    decoded_images = 0
 
-    def detect(image_path: Path, max_side: int) -> tuple[bool, str, str]:
-        nonlocal cache_writes
+    def detect(image_path: Path, max_side: int) -> tuple[bool, str, str, bool]:
+        nonlocal cache_writes, cache_hits, decoded_images
         stat = image_path.stat()
         resolved_path = str(image_path.resolve())
         cache_key = (
@@ -529,7 +602,9 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
         )
         with ANALYSIS_CACHE_LOCK:
             cached = ANALYSIS_CACHE.get(cache_key)
+        cache_hit = cached is not None
         if cached is None:
+            decoded_images += 1
             detection = analyze_image(
                 image_path, min_diameter, contrast_ratio, annotate=False, max_side=max_side
             )
@@ -548,7 +623,9 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
             cache_writes += 1
             if cache_writes % 100 == 0:
                 cache_connection.commit()
-        return cached
+        else:
+            cache_hits += 1
+        return cached[0], cached[1], cached[2], cache_hit
 
     states = {key: {"gray": None, "green": None} for key in ordered_keys}
     errors = {key: [] for key in ordered_keys}
@@ -560,13 +637,28 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
             continue
         gray_pass = "gris"
         try:
-            detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
+            detected, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
+                if logger:
+                    logger.write(
+                        f"IMAGE_ERROR | source=gray | produit={groups[key]['product_name']} | "
+                        f"cache={cache_hit} | fichier={image_path} | détail={error}"
+                    )
             else:
                 states[key]["gray"] = detected
+                if logger:
+                    logger.write(
+                        f"IMAGE_RESULT | source=gray | produit={groups[key]['product_name']} | "
+                        f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
+                    )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
+            if logger:
+                logger.write_exception(
+                    f"IMAGE_EXCEPTION | source=gray | produit={groups[key]['product_name']} | fichier={image_path} | "
+                    f"détail={_exception_description(exc)}"
+                )
         processed_images += 1
         if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
             progress_callback({
@@ -574,31 +666,36 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
                 "product": groups[key]["product_name"], "source": gray_pass,
             })
 
-    # Green images are limited to date/product folders in the selected
-    # interval. Gray-negative products also need a green result for rate 3.
+    # Analyze the green source independently, even if its gray counterpart is
+    # missing or unreadable. The join happens only after both passes finish.
     for key in ordered_keys:
         image_path = groups[key]["green"]
         if image_path is None:
             continue
-        if states[key]["gray"] is None:
-            # Count this slot as skipped so the progress bar still reaches 100%
-            # without decoding green images that cannot be compared.
-            processed_images += 1
-            if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
-                progress_callback({
-                    "phase": "process", "done": processed_images, "total": total_images,
-                    "product": groups[key]["product_name"], "source": "vert ignoré",
-                })
-            continue
         green_pass = "vert"
         try:
-            detected, _mode, error = detect(image_path, MAX_ANALYSIS_SIDE)
+            detected, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
+                if logger:
+                    logger.write(
+                        f"IMAGE_ERROR | source=green | produit={groups[key]['product_name']} | "
+                        f"cache={cache_hit} | fichier={image_path} | détail={error}"
+                    )
             else:
                 states[key]["green"] = detected
+                if logger:
+                    logger.write(
+                        f"IMAGE_RESULT | source=green | produit={groups[key]['product_name']} | "
+                        f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
+                    )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
+            if logger:
+                logger.write_exception(
+                    f"IMAGE_EXCEPTION | source=green | produit={groups[key]['product_name']} | fichier={image_path} | "
+                    f"détail={_exception_description(exc)}"
+                )
         processed_images += 1
         if progress_callback and (processed_images % 5 == 0 or processed_images == total_images):
             progress_callback({
@@ -627,6 +724,27 @@ def _scan_folders_with_cache(config: dict, progress_callback, cache_connection: 
         })
     if progress_callback:
         progress_callback({"phase": "save", "done": processed_images, "total": total_images})
+    if logger:
+        logger.write(
+            f"SCAN_SUMMARY | images={total_images} | décodées={decoded_images} | cache={cache_hits} | "
+            f"erreurs={sum(len(item) for item in errors.values())} | produits={len(results)}"
+        )
+        for kind, label in (("gray", "gris"), ("green", "vert")):
+            found = sum(groups[key][kind] is not None for key in ordered_keys)
+            analyzed = sum(states[key][kind] is not None for key in ordered_keys)
+            positives = sum(states[key][kind] is True for key in ordered_keys)
+            logger.write(
+                f"SOURCE_RESULT_SUMMARY | source={label} | images_trouvées={found} | "
+                f"analysées={analyzed} | détectées={positives} | sans_détection={analyzed - positives}"
+            )
+        category_counts = {
+            category: sum(row["comparable"] and row["category"] == category for row in results)
+            for category in ("Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement")
+        }
+        logger.write(
+            f"COMPARISON_SUMMARY | paires={sum(row['comparable'] for row in results)} | "
+            + " | ".join(f"{name}={count}" for name, count in category_counts.items())
+        )
     return results
 
 
@@ -666,15 +784,14 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
                 json.dumps(row["image_paths"], ensure_ascii=False),
                 " | ".join(row["errors"]), scanned_at,
             ))
-    analyzed_products = sum(
-        1 for item in results
-        if item["gray_state"] is not None or item["green_state"] is not None
-    )
+    comparable_products = sum(1 for item in results if item["comparable"])
     with_defect = sum(
         1 for item in results
-        if item["category"] in {"Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement"}
+        if item["comparable"] and item["category"] in {
+            "Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement"
+        }
     )
-    return analyzed_products, with_defect
+    return comparable_products, with_defect
 
 
 def read_current_results(start_date: str, end_date: str) -> list[tuple]:
@@ -920,14 +1037,20 @@ class MonitorApp:
         self.progress_queue: queue.Queue = queue.Queue()
         self.progress_mode = "determinate"
         self.next_scan_id: str | None = None
+        try:
+            previous_logs = list(LOG_DIRECTORY.glob("analyse_*.log"))
+            self.latest_log_path: Path | None = max(previous_logs, key=lambda item: item.stat().st_mtime) if previous_logs else None
+        except OSError:
+            self.latest_log_path = None
         self.category_names = (
             "Dossier 1 uniquement",
             "Présent dans les deux",
             "Dossier 2 uniquement",
         )
         self.rate_vars = {name: StringVar(value="— %") for name in self.category_names}
-        self.rate_count_vars = {name: StringVar(value="0 / 0 produit") for name in self.category_names}
-        self.count_var = StringVar(value="En attente des paramètres")
+        self.rate_count_vars = {name: StringVar(value="0 / 0 paire") for name in self.category_names}
+        self.source_summary_var = StringVar(value="Détections individuelles : en attente")
+        self.count_var = StringVar(value="Paires comparables : en attente")
         self.status_var = StringVar(value="Surveillance arrêtée")
         self.progress_text_var = StringVar(value="Prêt")
         self.filter_var = StringVar(value="")
@@ -938,8 +1061,8 @@ class MonitorApp:
 
     def _build_main_window(self) -> None:
         self.root.title("Suivi du claquage")
-        self.root.geometry("520x475")
-        self.root.minsize(490, 430)
+        self.root.geometry("560x515")
+        self.root.minsize(540, 480)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -963,7 +1086,13 @@ class MonitorApp:
             ttk.Label(card, textvariable=self.rate_vars[category], font=("Segoe UI", 18, "bold"), foreground="#b42318").pack()
             ttk.Label(card, textvariable=self.rate_count_vars[category], font=("Segoe UI", 8)).pack()
 
-        ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 10)).pack()
+        ttk.Label(frame, textvariable=self.source_summary_var, font=("Segoe UI", 9)).pack(pady=(1, 0))
+        ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
+        ttk.Label(
+            frame,
+            text="À vérifier = image manquante ou illisible ; exclu des taux T1/T2/T3",
+            font=("Segoe UI", 8), foreground="#555555",
+        ).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))
         progress_row = ttk.Frame(frame)
         progress_row.pack(fill="x", pady=(0, 4))
@@ -989,6 +1118,7 @@ class MonitorApp:
         ttk.Button(buttons, text="Réouvrir les paramètres", command=self.open_settings).pack(side="left")
         ttk.Button(buttons, text="Analyser", command=self.scan_now).pack(side="left", padx=6)
         ttk.Button(buttons, text="CSV", command=self.export_csv).pack(side="left")
+        ttk.Button(buttons, text="Journal", command=self.open_diagnostics).pack(side="left", padx=6)
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
 
     def set_config(self, config: dict) -> None:
@@ -1010,12 +1140,23 @@ class MonitorApp:
                 pass
         self.settings_window = SettingsWindow(self)
 
+    def _write_preflight_log(self, config: dict, message: str) -> None:
+        try:
+            logger = AnalysisLogger()
+            logger.write("CONFIG | " + json.dumps(config, ensure_ascii=False))
+            logger.write(f"PREFLIGHT_ERROR | {message}")
+            self.latest_log_path = logger.path
+            logger.close()
+        except Exception:
+            pass
+
     def scan_now(self) -> None:
         if self.scan_running:
             self.status_var.set("Analyse déjà en cours…")
             return
         config = dict(self.config)
         if not config.get("folder_gray") and not config.get("folder_green"):
+            self._write_preflight_log(config, "Aucun dossier gris ou vert n’est configuré.")
             self.status_var.set("Choisissez au moins un dossier")
             self.open_settings()
             return
@@ -1024,7 +1165,9 @@ class MonitorApp:
             if folder and not Path(folder).expanduser().is_dir()
         ]
         if missing:
-            self.status_var.set("Dossier introuvable : " + ", ".join(missing))
+            message = "Dossier introuvable ou inaccessible : " + ", ".join(missing)
+            self._write_preflight_log(config, message)
+            self.status_var.set(message + " · ouvrir Journal")
             return
         while True:
             try:
@@ -1088,45 +1231,85 @@ class MonitorApp:
 
     def _scan_worker(self, config: dict) -> None:
         started = time.monotonic()
+        logger = None
         try:
-            results = scan_folders(config, progress_callback=self.progress_queue.put)
+            logger = AnalysisLogger()
+            self.latest_log_path = logger.path
+            logger.write(
+                "CONFIG | " + json.dumps({
+                    "analysis_start_date": config.get("analysis_start_date"),
+                    "analysis_end_date": config.get("analysis_end_date"),
+                    "folder_gray": config.get("folder_gray"),
+                    "folder_green": config.get("folder_green"),
+                    "filename_pattern": config.get("filename_pattern"),
+                    "min_spot_diameter_percent": config.get("min_spot_diameter_percent"),
+                    "contrast_ratio": config.get("contrast_ratio"),
+                }, ensure_ascii=False),
+            )
+            results = scan_folders(config, progress_callback=self.progress_queue.put, logger=logger)
             total, defects = save_results(results, config)
             duration = time.monotonic() - started
-            self.root.after(0, lambda: self._scan_finished(results, total, defects, duration, ""))
+            logger.write(
+                f"RUN_FINISHED | résultat_enregistré | durée_secondes={duration:.2f} | "
+                f"produits={len(results)} | paires={total} | détections_dans_paires={defects}"
+            )
+            log_path = logger.path
+            self.root.after(0, lambda: self._scan_finished(results, total, defects, duration, "", log_path))
         except Exception as exc:
-            self.root.after(0, lambda message=str(exc): self._scan_finished([], 0, 0, 0, message))
+            message = _exception_description(exc)
+            if logger:
+                logger.write_exception(f"RUN_FATAL | {message}")
+                log_path = logger.path
+            else:
+                log_path = None
+            self.root.after(0, lambda: self._scan_finished([], 0, 0, 0, message, log_path))
+        finally:
+            if logger:
+                logger.close()
 
-    def _scan_finished(self, results: list[dict], total: int, defects: int, duration: float, error: str) -> None:
+    def _scan_finished(
+        self,
+        results: list[dict],
+        total: int,
+        defects: int,
+        duration: float,
+        error: str,
+        log_path: Path | None = None,
+    ) -> None:
         self.scan_running = False
+        if log_path:
+            self.latest_log_path = log_path
         self.progress_bar.stop()
         self.progress_bar.configure(mode="determinate", maximum=1, value=0 if error else 1)
         self.progress_mode = "determinate"
         if error:
             self.progress_text_var.set("Échec de l’analyse")
-            self.status_var.set("Erreur d’analyse")
-            messagebox.showerror("Erreur", error, parent=self.root)
+            self.status_var.set("Erreur d’analyse · ouvrir Journal pour le détail")
+            messagebox.showerror(
+                "Erreur d’analyse",
+                error + (f"\n\nJournal détaillé : {log_path}" if log_path else ""),
+                parent=self.root,
+            )
             return
         self.refresh_summary()
         if not results:
             self.progress_text_var.set("Aucun dossier dans l’intervalle")
             self.status_var.set("Aucun dossier produit créé pendant cette période")
-        elif total == 0:
+        else:
+            gray_analyzed = sum(row["gray_state"] is not None for row in results)
+            green_analyzed = sum(row["green_state"] is not None for row in results)
+            pair_count = sum(row["comparable"] for row in results)
             gray_products = sum(bool(row["image_paths"]["gray"]) for row in results)
             green_products = sum(bool(row["image_paths"]["green"]) for row in results)
             errors = [error for row in results for error in row["errors"]]
-            self.progress_text_var.set(f"Terminé · 0 produit analysable · gris {gray_products} / vert {green_products}")
-            error_count = len(errors)
-            if error_count:
+            self.progress_text_var.set(
+                f"Terminé · gris {gray_analyzed}/{gray_products} · vert {green_analyzed}/{green_products} · paires {pair_count}"
+            )
+            if errors:
                 first_error = errors[0][:110]
-                self.status_var.set(f"{error_count} erreur(s) · exemple : {first_error} · détail dans le CSV")
-            else:
-                self.status_var.set("Vérifier la période, les numéros produit et les images picture_2")
-        else:
-            pair_count = sum(1 for row in results if row["comparable"])
-            error_count = sum(len(row["errors"]) for row in results)
-            self.progress_text_var.set(f"Terminé · {total} produit(s) analysé(s) · {pair_count} paire(s) complète(s)")
-            if error_count:
-                self.status_var.set(f"Mis à jour avec {error_count} erreur(s) d’image · détail dans le CSV")
+                self.status_var.set(f"{len(errors)} erreur(s) · exemple : {first_error} · ouvrir Journal")
+            elif not gray_analyzed and not green_analyzed:
+                self.status_var.set("Aucune image analysable · vérifier l’accès aux fichiers et les dates")
             else:
                 self.status_var.set(f"Mis à jour · {datetime.now().strftime('%H:%M:%S')} · {duration:.1f} s")
 
@@ -1139,30 +1322,48 @@ class MonitorApp:
             gray_value = {"oui": True, "non": False}.get(row[1])
             green_value = {"oui": True, "non": False}.get(row[2])
             classified_rows.append((row, _classify_states(gray_value, green_value)))
-        analyzed_rows = [
-            row for row, _category in classified_rows
-            if row[1] != "—" or row[2] != "—"
-        ]
-        total = len(analyzed_rows)
-        pair_count = sum(1 for row in analyzed_rows if row[4])
+        gray_rows = [row for row in rows if row[1] in {"oui", "non"}]
+        green_rows = [row for row in rows if row[2] in {"oui", "non"}]
+        pair_rows = [row for row in rows if row[1] in {"oui", "non"} and row[2] in {"oui", "non"}]
+        pair_count = len(pair_rows)
         category_counts = {
-            category: sum(1 for row, classified in classified_rows if classified == category)
+            category: sum(
+                1 for row in pair_rows
+                if _classify_states(row[1] == "oui", row[2] == "oui") == category
+            )
             for category in self.category_names
         }
         defects = sum(category_counts.values())
-        if total:
+        gray_positive = sum(1 for row in gray_rows if row[1] == "oui")
+        green_positive = sum(1 for row in green_rows if row[2] == "oui")
+
+        def source_rate(label: str, positive: int, analyzed: int) -> str:
+            if analyzed == 0:
+                return f"{label} : — (0/0 image)"
+            percentage = 100.0 * positive / analyzed
+            return f"{label} : {positive}/{analyzed} ({percentage:.1f} %)"
+
+        self.source_summary_var.set(
+            source_rate("Gris", gray_positive, len(gray_rows))
+            + "  ·  "
+            + source_rate("Vert", green_positive, len(green_rows))
+        )
+        if pair_count:
             for category in self.category_names:
                 count = category_counts[category]
-                self.rate_vars[category].set(f"{100.0 * count / total:.1f} %")
-                self.rate_count_vars[category].set(f"{count} / {total} produit(s)")
+                self.rate_vars[category].set(f"{100.0 * count / pair_count:.1f} %")
+                self.rate_count_vars[category].set(f"{count} / {pair_count} paire(s)")
             self.count_var.set(
-                f"{defects} produit(s) avec claquage · {total} analysé(s) · {pair_count} paire(s) complète(s)"
+                f"Paires comparables : {pair_count} · {defects} avec au moins une détection"
             )
         else:
             for category in self.category_names:
                 self.rate_vars[category].set("— %")
-                self.rate_count_vars[category].set("0 / 0 produit")
-            self.count_var.set("Aucun produit analysable")
+                self.rate_count_vars[category].set("0 / 0 paire")
+            self.count_var.set(
+                f"Aucune paire comparable · {len(gray_rows)} image(s) grise(s) analysée(s) · "
+                f"{len(green_rows)} verte(s) analysée(s)"
+            )
         self.filter_var.set(f"{start_date} → {end_date} · toutes tailles de module")
         for item in self.table.get_children():
             self.table.delete(item)
@@ -1196,6 +1397,77 @@ class MonitorApp:
         if self.config.get("monitoring_enabled") and (self.config.get("folder_gray") or self.config.get("folder_green")):
             self.scan_now()
         self.schedule_next_scan()
+
+    def open_diagnostics(self) -> None:
+        if not self.latest_log_path or not self.latest_log_path.is_file():
+            try:
+                candidates = list(LOG_DIRECTORY.glob("analyse_*.log"))
+                self.latest_log_path = max(candidates, key=lambda item: item.stat().st_mtime) if candidates else None
+            except OSError:
+                self.latest_log_path = None
+
+        window = Toplevel(self.root)
+        window.title("Journal de diagnostic")
+        window.geometry("760x540")
+        window.minsize(600, 420)
+        window.transient(self.root)
+
+        ttk.Label(
+            window,
+            text="Le journal détaille les dossiers parcourus, les résultats image par image et les erreurs avec leur trace technique.",
+            wraplength=720,
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+        ttk.Label(
+            window,
+            text="Il contient les chemins des dossiers et numéros produit, mais aucune image. Vérifie ces informations avant de le transmettre.",
+            wraplength=720, foreground="#555555",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        content = ttk.Frame(window, padding=(12, 0, 12, 0))
+        content.pack(fill="both", expand=True)
+        viewer = Text(content, wrap="none", height=20, state="normal")
+        vertical = ttk.Scrollbar(content, orient="vertical", command=viewer.yview)
+        horizontal = ttk.Scrollbar(content, orient="horizontal", command=viewer.xview)
+        viewer.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        viewer.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        if self.latest_log_path and self.latest_log_path.is_file():
+            try:
+                lines = self.latest_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                viewer.insert("1.0", f"Journal : {self.latest_log_path}\n\n" + "\n".join(lines[-600:]))
+            except OSError as exc:
+                viewer.insert("1.0", f"Impossible de lire le journal : {_exception_description(exc)}")
+        else:
+            viewer.insert("1.0", "Aucun journal disponible. Lance une analyse, puis ouvre à nouveau cette fenêtre.")
+        viewer.configure(state="disabled")
+
+        buttons = ttk.Frame(window, padding=12)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Exporter le journal…", command=self.export_log).pack(side="left")
+        ttk.Button(buttons, text="Fermer", command=window.destroy).pack(side="right")
+
+    def export_log(self) -> None:
+        if not self.latest_log_path or not self.latest_log_path.is_file():
+            messagebox.showinfo("Journal", "Aucun journal à exporter. Lance d’abord une analyse.", parent=self.root)
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Exporter le journal de diagnostic",
+            defaultextension=".log",
+            initialfile="journal_claquage.log",
+            filetypes=(("Journal texte", "*.log"), ("Fichier texte", "*.txt")),
+        )
+        if not destination:
+            return
+        try:
+            shutil.copyfile(self.latest_log_path, destination)
+            self.status_var.set("Journal de diagnostic exporté")
+            messagebox.showinfo("Journal exporté", f"Le journal a été enregistré ici :\n{destination}", parent=self.root)
+        except OSError as exc:
+            messagebox.showerror("Export impossible", _exception_description(exc), parent=self.root)
 
     def export_csv(self) -> None:
         if not DATABASE_FILE.exists():
