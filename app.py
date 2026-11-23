@@ -857,6 +857,7 @@ ARCHIVE_CATEGORIES = {
     "Dossier 1 uniquement": "T1_Dossier1_uniquement.zip",
     "Présent dans les deux": "T2_Present_dans_les_deux.zip",
     "Dossier 2 uniquement": "T3_Dossier2_uniquement.zip",
+    "À vérifier": "Photos_a_verifier.zip",
 }
 
 
@@ -882,12 +883,15 @@ def create_category_archives(
             image_paths = json.loads(paths_json)
             gray_paths = image_paths.get("gray", [])
             green_paths = image_paths.get("green", [])
-            if not gray_paths or not green_paths:
+            if category != "À vérifier" and (not gray_paths or not green_paths):
                 errors.append(f"{category} | {display_name} | image grise ou verte absente du résultat")
                 continue
+            if category == "À vérifier" and not gray_paths and not green_paths:
+                errors.append(f"{category} | {display_name} | aucun chemin d’image disponible")
+                continue
             categorized[category].append((display_name, {
-                "gray": [str(gray_paths[0])],
-                "green": [str(green_paths[0])],
+                "gray": [str(gray_paths[0])] if gray_paths else [],
+                "green": [str(green_paths[0])] if green_paths else [],
             }))
         except (json.JSONDecodeError, TypeError, AttributeError, IndexError) as exc:
             errors.append(f"{category} | {display_name} | chemins illisibles : {_exception_description(exc)}")
@@ -905,25 +909,37 @@ def create_category_archives(
     for category, archive_name in ARCHIVE_CATEGORIES.items():
         archive_path = output_directory / archive_name
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            readme = (
+                "Les images disponibles pour les produits à vérifier sont rangées par numéro produit. "
+                "Un produit peut ne contenir qu’une seule image si l’autre manque.\n"
+                if category == "À vérifier"
+                else "Chaque dossier produit contient les images grise et verte picture_2.\n"
+            )
             archive.writestr(
                 "Lisez-moi.txt",
                 f"Catégorie : {category}\nPériode : {start_date} au {end_date}\n"
-                "Chaque dossier produit contient l’image grise et l’image verte picture_2.\n",
+                + readme,
             )
             for product_name, image_paths in categorized[category]:
                 processed += 1
-                try:
-                    gray_path = Path(image_paths["gray"][0])
-                    green_path = Path(image_paths["green"][0])
-                    gray_bytes = gray_path.read_bytes()
-                    green_bytes = green_path.read_bytes()
-                    product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "produit_inconnu"
-                    archive.writestr(f"{product_folder}/gris_{gray_path.name}", gray_bytes)
-                    archive.writestr(f"{product_folder}/vert_{green_path.name}", green_bytes)
-                    counts[category] += 1
-                except (OSError, ValueError) as exc:
-                    detail = f"{category} | {product_name} | {_exception_description(exc)}"
-                    errors.append(detail)
+                entries: list[tuple[str, bytes]] = []
+                for source, prefix in (("gray", "gris"), ("green", "vert")):
+                    for image_text in image_paths[source][:1]:
+                        try:
+                            image_path = Path(image_text)
+                            entries.append((f"{prefix}_{image_path.name}", image_path.read_bytes()))
+                        except (OSError, ValueError) as exc:
+                            errors.append(
+                                f"{category} | {product_name} | {source} | {_exception_description(exc)}"
+                            )
+                if category != "À vérifier" and len(entries) != 2:
+                    continue
+                if not entries:
+                    continue
+                product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "produit_inconnu"
+                for entry_name, image_bytes in entries:
+                    archive.writestr(f"{product_folder}/{entry_name}", image_bytes)
+                counts[category] += 1
                 if progress_callback:
                     progress_callback({
                         "phase": "archive", "done": processed, "total": total_products,
@@ -1249,7 +1265,7 @@ class MonitorApp:
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
         ttk.Label(
             frame,
-            text="À vérifier = image manquante ou illisible ; exclu des taux T1/T2/T3",
+            text="À vérifier = image manquante ou illisible ; photos disponibles dans Photos_a_verifier.zip",
             font=("Segoe UI", 8), foreground="#555555",
         ).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))

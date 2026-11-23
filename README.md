@@ -46,7 +46,18 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 - Bouton `Journal` : affiche et exporte le journal de la dernière analyse, avec les erreurs détaillées et leurs traces techniques.
 - Choix d’un dossier de destination dans les paramètres, puis bouton `Archives` pour créer les résultats ZIP de la période sélectionnée.
 
-L’export crée un sous-dossier daté dans le dossier de destination, contenant trois archives : `T1_Dossier1_uniquement.zip`, `T2_Present_dans_les_deux.zip` et `T3_Dossier2_uniquement.zip`. Chaque archive contient un dossier par numéro produit avec les deux fichiers `picture_2`, préfixés `gris_` et `vert_`. Seuls les produits comparables classés T1/T2/T3 sont inclus ; les lignes « À vérifier » et les produits sans détection ne sont pas archivés. Le fichier `resume_archivage.txt` indique le nombre de produits par catégorie et les éventuelles images qui n’ont pas pu être copiées.
+L’export crée un sous-dossier daté dans le dossier de destination, contenant quatre archives : `T1_Dossier1_uniquement.zip`, `T2_Present_dans_les_deux.zip`, `T3_Dossier2_uniquement.zip` et `Photos_a_verifier.zip`. Les archives T1/T2/T3 contiennent un dossier par numéro produit avec les deux fichiers `picture_2`, préfixés `gris_` et `vert_`. `Photos_a_verifier.zip` contient les images disponibles pour les produits où une image manque ou n’a pas pu être analysée ; un dossier produit peut donc contenir une seule image. Les produits sans détection ne sont pas archivés. Le fichier `resume_archivage.txt` indique le nombre de produits par catégorie et les éventuelles images qui n’ont pas pu être copiées.
+
+## Personnaliser les textes de l’interface
+
+Les libellés sont écrits directement dans `claquage_monitor/app.py` :
+
+- Fenêtre principale, titre, en-tête, explications et boutons : méthode `MonitorApp._build_main_window`.
+- Paramètres, noms des champs, textes d’aide et boutons : constructeur `SettingsWindow.__init__`.
+- Fenêtre d’essai des images : constructeur `ImageTestWindow.__init__`.
+- Noms des catégories et des fichiers ZIP : constantes `ARCHIVE_CATEGORIES` et `MonitorApp.category_names`.
+
+Tu peux rechercher le texte exact dans `app.py`, puis le remplacer. Pour changer les noms des catégories, modifie aussi les textes de logique associés à `_classify_states`, car les catégories servent également aux calculs et au classement des résultats. Après une modification, il faut recréer l’exécutable avec GitHub Actions.
 
 Les résultats et les journaux (30 derniers scans) sont enregistrés localement dans `%LOCALAPPDATA%\SuiviClaquage`. Le journal contient les chemins des dossiers et numéros produit ainsi que les détails d’erreur, mais aucune image. Les images de production ne sont pas incluses dans le dépôt GitHub : l’application analyse les dossiers locaux et ne téléverse pas les images vers GitHub. Les archives créées sont écrites uniquement dans le dossier de destination choisi.
 
