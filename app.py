@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
@@ -21,14 +22,14 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
-APP_VERSION = "2026.11.20-cachefix"
+APP_VERSION = "2026.11.23-qia-pheaperiphery"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
-ANALYSIS_CACHE_VERSION = 2
+ANALYSIS_CACHE_VERSION = 3
 # Bump this table suffix whenever the image detection logic changes. Older
 # cached labels were produced before the disk-boundary correction and are stale.
-IMAGE_ANALYSIS_CACHE_TABLE = "image_analysis_cache_v2"
-ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
+IMAGE_ANALYSIS_CACHE_TABLE = "image_analysis_cache_v3"
+ANALYSIS_CACHE: dict[tuple, tuple[bool, bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
 
@@ -92,6 +93,9 @@ DEFAULT_CONFIG = {
     "interval_seconds": 30,
     "min_spot_diameter_percent": 1.8,
     "contrast_ratio": 0.20,
+    "peripheral_zone_percent": 2.5,
+    "peripheral_area_percent": 48.0,
+    "peripheral_dark_percent": 28.0,
     "monitoring_enabled": True,
 }
 
@@ -192,6 +196,9 @@ def analyze_image(
     path: str | Path,
     min_diameter_percent: float,
     contrast_ratio: float,
+    peripheral_zone_percent: float = 2.5,
+    peripheral_area_percent: float = 48.0,
+    peripheral_dark_percent: float = 28.0,
     annotate: bool = True,
     max_side: int = MAX_ANALYSIS_SIDE,
 ) -> dict:
@@ -219,7 +226,7 @@ def analyze_image(
     if is_green:
         signal = green
         bright = (green > 15) & (green_difference > 8)
-        mode = "image verte"
+        mode = "image PHEA"
     else:
         signal = (red + green + blue) / 3.0
         bright = signal > 12
@@ -232,7 +239,8 @@ def analyze_image(
     if len(xs) < 100:
         return {
             "path": str(path), "detected": False, "mode": mode,
-            "spots": [], "annotated": original, "error": "Disque lumineux non détecté",
+            "peripheral_detected": False, "spots": [], "annotated": original,
+            "error": "Disque lumineux non détecté",
         }
 
     # Percentile bounds and the radial distance are resistant to small defects,
@@ -244,7 +252,8 @@ def analyze_image(
     if radius < 4:
         return {
             "path": str(path), "detected": False, "mode": mode,
-            "spots": [], "annotated": original, "error": "Disque trop petit pour l’analyse",
+            "peripheral_detected": False, "spots": [], "annotated": original,
+            "error": "Disque trop petit pour l’analyse",
         }
 
     height, width = signal.shape
@@ -277,7 +286,8 @@ def analyze_image(
     if known.size < 3:
         return {
             "path": str(path), "detected": False, "mode": mode,
-            "spots": [], "annotated": original, "error": "Contraste insuffisant pour l’analyse",
+            "peripheral_detected": False, "spots": [], "annotated": original,
+            "error": "Contraste insuffisant pour l’analyse",
         }
     profile = np.interp(np.arange(len(profile)), known, profile[known]).astype(np.float32)
     window = np.ones(7, dtype=np.float32) / 7.0
@@ -304,8 +314,10 @@ def analyze_image(
             for y, left, right in component["runs"]
             for x in (left, right)
         )
-        touches_edge = farthest_radius >= radius * 0.975
-        needed_area = max(5, int(min_area * (0.48 if touches_edge else 1.0)))
+        edge_zone = min(20.0, max(0.5, float(peripheral_zone_percent))) / 100.0
+        touches_edge = farthest_radius >= radius * (1.0 - edge_zone)
+        edge_area_factor = min(100.0, max(10.0, float(peripheral_area_percent))) / 100.0
+        needed_area = max(5, int(min_area * (edge_area_factor if touches_edge else 1.0)))
         if component["area"] < needed_area:
             continue
         component_width = component["right"] - component["left"] + 1
@@ -326,7 +338,8 @@ def analyze_image(
             contrast_total += float(np.sum(patch_expected - patch_values))
         very_dark_fraction = very_dark_count / component["area"]
         average_contrast = contrast_total / component["area"]
-        if very_dark_fraction < (0.28 if touches_edge else 0.38):
+        edge_dark_fraction = min(80.0, max(10.0, float(peripheral_dark_percent))) / 100.0
+        if very_dark_fraction < (edge_dark_fraction if touches_edge else 0.38):
             continue
         if average_contrast < 18:
             continue
@@ -359,6 +372,12 @@ def analyze_image(
                 (left - pad_x, top - pad_y, right + pad_x, bottom + pad_y),
                 outline=(255, 40, 40), width=max(4, original_size[0] // 500),
             )
+            if component["touches_edge"]:
+                draw.ellipse(
+                    (left - pad_x * 1.55, top - pad_y * 1.55,
+                     right + pad_x * 1.55, bottom + pad_y * 1.55),
+                    outline=(255, 0, 255), width=max(4, original_size[0] // 500),
+                )
         spots.append({
             "x": component["x"] * scale_x,
             "y": component["y"] * scale_y,
@@ -368,6 +387,7 @@ def analyze_image(
 
     return {
         "path": str(path), "detected": bool(spots), "mode": mode,
+        "peripheral_detected": any(spot["touches_edge"] for spot in spots),
         "spots": spots, "annotated": original, "error": "",
     }
 
@@ -394,15 +414,15 @@ def _exception_description(exc: Exception) -> str:
 
 
 def _classify_states(gray_state: bool | None, green_state: bool | None) -> str:
-    """Compare a product only when both image analyses produced a result."""
+    """Compare a module only when both image analyses produced a result."""
     if gray_state is None or green_state is None:
         return "À vérifier"
     if gray_state is True and green_state is True:
-        return "Présent dans les deux"
+        return "Présent dans QIA et PHEA"
     if gray_state is True:
-        return "Dossier 1 uniquement"
+        return "QIA uniquement"
     if green_state is True:
-        return "Dossier 2 uniquement"
+        return "PHEA uniquement"
     if gray_state is False and green_state is False:
         return "Aucun claquage"
     return "À vérifier"
@@ -440,6 +460,9 @@ def _picture_2_in(product_folder: Path, pattern: str) -> Path | None:
 def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | None = None) -> list[dict]:
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
+    peripheral_zone = float(config.get("peripheral_zone_percent", 2.5))
+    peripheral_area = float(config.get("peripheral_area_percent", 48.0))
+    peripheral_dark = float(config.get("peripheral_dark_percent", 28.0))
     connection = sqlite3.connect(DATABASE_FILE)
     try:
         connection.execute(f"""
@@ -449,23 +472,34 @@ def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | 
                 file_size INTEGER NOT NULL,
                 min_diameter REAL NOT NULL,
                 contrast_ratio REAL NOT NULL,
+                peripheral_zone REAL NOT NULL,
+                peripheral_area REAL NOT NULL,
+                peripheral_dark REAL NOT NULL,
                 max_side INTEGER NOT NULL,
                 detected INTEGER NOT NULL,
+                peripheral_detected INTEGER NOT NULL,
                 mode TEXT NOT NULL,
                 error_text TEXT NOT NULL,
-                PRIMARY KEY (path, modified_ns, file_size, min_diameter, contrast_ratio, max_side)
+                PRIMARY KEY (path, modified_ns, file_size, min_diameter, contrast_ratio,
+                             peripheral_zone, peripheral_area, peripheral_dark, max_side)
             )
         """)
         rows = connection.execute(f"""
             SELECT path, modified_ns, file_size, min_diameter, contrast_ratio,
-                   max_side, detected, mode, error_text
+                   peripheral_zone, peripheral_area, peripheral_dark, max_side,
+                   detected, peripheral_detected, mode, error_text
             FROM {IMAGE_ANALYSIS_CACHE_TABLE}
-            WHERE min_diameter=? AND contrast_ratio=?
-        """, (min_diameter, contrast_ratio)).fetchall()
+            WHERE min_diameter=? AND contrast_ratio=? AND peripheral_zone=?
+              AND peripheral_area=? AND peripheral_dark=?
+        """, (min_diameter, contrast_ratio, peripheral_zone, peripheral_area, peripheral_dark)).fetchall()
         with ANALYSIS_CACHE_LOCK:
-            for path, modified_ns, file_size, min_value, contrast_value, max_side, detected, mode, error_text in rows:
-                key = (ANALYSIS_CACHE_VERSION, path, modified_ns, file_size, min_value, contrast_value, max_side)
-                ANALYSIS_CACHE[key] = (bool(detected), mode, error_text)
+            for (path, modified_ns, file_size, min_value, contrast_value, zone_value,
+                 area_value, dark_value, max_side, detected, peripheral_detected, mode, error_text) in rows:
+                key = (
+                    ANALYSIS_CACHE_VERSION, path, modified_ns, file_size, min_value,
+                    contrast_value, zone_value, area_value, dark_value, max_side,
+                )
+                ANALYSIS_CACHE[key] = (bool(detected), bool(peripheral_detected), mode, error_text)
         connection.commit()
         return _scan_folders_with_cache(config, progress_callback, connection, logger)
     finally:
@@ -497,18 +531,19 @@ def _scan_folders_with_cache(
         "green": {"folders": 0, "in_interval": 0, "missing_date": 0, "outside_interval": 0, "images": 0},
     }
     for kind, root_text in roots:
+        source_label = "QIA" if kind == "gray" else "PHEA"
         if not root_text:
             if logger:
-                logger.write(f"SOURCE_SEARCH | source={kind} | ignorée: aucun dossier configuré")
+                logger.write(f"SOURCE_SEARCH | source={source_label} | ignorée: aucun dossier configuré")
             continue
         root = Path(root_text).expanduser()
         if not root.is_dir():
             if logger:
-                logger.write(f"SOURCE_SEARCH_ERROR | source={kind} | dossier inexistant ou inaccessible: {root}")
+                logger.write(f"SOURCE_SEARCH_ERROR | source={source_label} | dossier inexistant ou inaccessible: {root}")
             continue
         try:
             if logger:
-                logger.write(f"SOURCE_SEARCH | source={kind} | racine={root}")
+                logger.write(f"SOURCE_SEARCH | source={source_label} | racine={root}")
             top_folders = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold())
             if kind == "gray":
                 product_folders = [(item, None) for item in top_folders]
@@ -585,18 +620,21 @@ def _scan_folders_with_cache(
                     discovery[kind]["images"] += 1
         except OSError:
             if logger:
-                logger.write_exception(f"SOURCE_SEARCH_ERROR | source={kind} | racine={root}")
+                logger.write_exception(f"SOURCE_SEARCH_ERROR | source={source_label} | racine={root}")
             continue
         if logger:
             summary = discovery[kind]
             logger.write(
-                f"SOURCE_SEARCH_SUMMARY | source={kind} | dossiers={summary['folders']} | "
+                f"SOURCE_SEARCH_SUMMARY | source={source_label} | dossiers={summary['folders']} | "
                 f"dans_intervalle={summary['in_interval']} | dates_absentes={summary['missing_date']} | "
                 f"hors_intervalle={summary['outside_interval']} | picture_2_trouvées={summary['images']}"
             )
 
     min_diameter = float(config.get("min_spot_diameter_percent", 1.8))
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
+    peripheral_zone = float(config.get("peripheral_zone_percent", 2.5))
+    peripheral_area = float(config.get("peripheral_area_percent", 48.0))
+    peripheral_dark = float(config.get("peripheral_dark_percent", 28.0))
     ordered_keys = sorted(groups, key=str.casefold)
     total_images = sum(
         int(groups[key]["gray"] is not None)
@@ -611,13 +649,13 @@ def _scan_folders_with_cache(
     cache_hits = 0
     decoded_images = 0
 
-    def detect(image_path: Path, max_side: int) -> tuple[bool, str, str, bool]:
+    def detect(image_path: Path, max_side: int) -> tuple[bool, bool, str, str, bool]:
         nonlocal cache_writes, cache_hits, decoded_images
         stat = image_path.stat()
         resolved_path = str(image_path.resolve())
         cache_key = (
             ANALYSIS_CACHE_VERSION, resolved_path, stat.st_mtime_ns, stat.st_size,
-            min_diameter, contrast_ratio, max_side,
+            min_diameter, contrast_ratio, peripheral_zone, peripheral_area, peripheral_dark, max_side,
         )
         with ANALYSIS_CACHE_LOCK:
             cached = ANALYSIS_CACHE.get(cache_key)
@@ -625,28 +663,37 @@ def _scan_folders_with_cache(
         if cached is None:
             decoded_images += 1
             detection = analyze_image(
-                image_path, min_diameter, contrast_ratio, annotate=False, max_side=max_side
+                image_path, min_diameter, contrast_ratio,
+                peripheral_zone, peripheral_area, peripheral_dark,
+                annotate=False, max_side=max_side,
             )
-            cached = (bool(detection["detected"]), detection["mode"], detection["error"])
+            cached = (
+                bool(detection["detected"]), bool(detection.get("peripheral_detected", False)),
+                detection["mode"], detection["error"],
+            )
             # Keep negative and unusable images cached too; automatic refreshes
             # should not decode the same unchanged TIFFs over and over.
             with ANALYSIS_CACHE_LOCK:
                 ANALYSIS_CACHE[cache_key] = cached
             cache_connection.execute(f"""
-                INSERT OR REPLACE INTO {IMAGE_ANALYSIS_CACHE_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO {IMAGE_ANALYSIS_CACHE_TABLE}
+                (path, modified_ns, file_size, min_diameter, contrast_ratio,
+                 peripheral_zone, peripheral_area, peripheral_dark, max_side,
+                 detected, peripheral_detected, mode, error_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 resolved_path, stat.st_mtime_ns, stat.st_size,
-                min_diameter, contrast_ratio, max_side,
-                int(cached[0]), cached[1], cached[2],
+                min_diameter, contrast_ratio, peripheral_zone, peripheral_area, peripheral_dark, max_side,
+                int(cached[0]), int(cached[1]), cached[2], cached[3],
             ))
             cache_writes += 1
             if cache_writes % 100 == 0:
                 cache_connection.commit()
         else:
             cache_hits += 1
-        return cached[0], cached[1], cached[2], cache_hit
+        return cached[0], cached[1], cached[2], cached[3], cache_hit
 
-    states = {key: {"gray": None, "green": None} for key in ordered_keys}
+    states = {key: {"gray": None, "green": None, "gray_peripheral": None} for key in ordered_keys}
     errors = {key: [] for key in ordered_keys}
 
     # Complete the gray pass first at the same resolution as the test window.
@@ -654,28 +701,30 @@ def _scan_folders_with_cache(
         image_path = groups[key]["gray"]
         if image_path is None:
             continue
-        gray_pass = "PHEA"
+        gray_pass = "QIA"
         try:
-            detected, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
+            detected, peripheral, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
                 if logger:
                     logger.write(
-                        f"IMAGE_ERROR | source=gray | module={groups[key]['product_name']} | "
+                        f"IMAGE_ERROR | source=QIA | module={groups[key]['product_name']} | "
                         f"cache={cache_hit} | fichier={image_path} | détail={error}"
                     )
             else:
                 states[key]["gray"] = detected
+                states[key]["gray_peripheral"] = peripheral
                 if logger:
                     logger.write(
-                        f"IMAGE_RESULT | source=gray | module={groups[key]['product_name']} | "
-                        f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
+                        f"IMAGE_RESULT | source=QIA | module={groups[key]['product_name']} | "
+                        f"détecté={'oui' if detected else 'non'} | périphérie={'oui' if peripheral else 'non'} | "
+                        f"cache={cache_hit} | fichier={image_path}"
                     )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
             if logger:
                 logger.write_exception(
-                    f"IMAGE_EXCEPTION | source=gray | module={groups[key]['product_name']} | fichier={image_path} | "
+                    f"IMAGE_EXCEPTION | source=QIA | module={groups[key]['product_name']} | fichier={image_path} | "
                     f"détail={_exception_description(exc)}"
                 )
         processed_images += 1
@@ -691,28 +740,28 @@ def _scan_folders_with_cache(
         image_path = groups[key]["green"]
         if image_path is None:
             continue
-        green_pass = "vert"
+        green_pass = "PHEA"
         try:
-            detected, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
+            detected, _peripheral, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
                 if logger:
                     logger.write(
-                        f"IMAGE_ERROR | source=green | module={groups[key]['product_name']} | "
+                        f"IMAGE_ERROR | source=PHEA | module={groups[key]['product_name']} | "
                         f"cache={cache_hit} | fichier={image_path} | détail={error}"
                     )
             else:
                 states[key]["green"] = detected
                 if logger:
                     logger.write(
-                        f"IMAGE_RESULT | source=green | module={groups[key]['product_name']} | "
+                        f"IMAGE_RESULT | source=PHEA | module={groups[key]['product_name']} | "
                         f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
                     )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
             if logger:
                 logger.write_exception(
-                    f"IMAGE_EXCEPTION | source=green | module={groups[key]['product_name']} | fichier={image_path} | "
+                    f"IMAGE_EXCEPTION | source=PHEA | module={groups[key]['product_name']} | fichier={image_path} | "
                     f"détail={_exception_description(exc)}"
                 )
         processed_images += 1
@@ -732,6 +781,7 @@ def _scan_folders_with_cache(
             "group_key": key,
             "display_name": group["product_name"],
             "gray_state": gray_state,
+            "gray_peripheral_state": states[key]["gray_peripheral"],
             "green_state": green_state,
             "category": category,
             "comparable": comparable,
@@ -758,7 +808,7 @@ def _scan_folders_with_cache(
             )
         category_counts = {
             category: sum(row["comparable"] and row["category"] == category for row in results)
-            for category in ("Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement")
+            for category in ("QIA uniquement", "Présent dans QIA et PHEA", "PHEA uniquement")
         }
         logger.write(
             f"COMPARISON_SUMMARY | paires={sum(row['comparable'] for row in results)} | "
@@ -767,27 +817,40 @@ def _scan_folders_with_cache(
     return results
 
 
+def _ensure_results_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS comparisons_intervals (
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            product_key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            gray_state TEXT NOT NULL,
+            green_state TEXT NOT NULL,
+            category TEXT NOT NULL,
+            comparable INTEGER NOT NULL,
+            image_paths TEXT NOT NULL,
+            error_text TEXT NOT NULL,
+            scanned_at TEXT NOT NULL,
+            gray_peripheral_state TEXT NOT NULL DEFAULT '—',
+            PRIMARY KEY (start_date, end_date, product_key)
+        )
+    """)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(comparisons_intervals)").fetchall()
+    }
+    if "gray_peripheral_state" not in columns:
+        connection.execute(
+            "ALTER TABLE comparisons_intervals "
+            "ADD COLUMN gray_peripheral_state TEXT NOT NULL DEFAULT '—'"
+        )
+
+
 def save_results(results: list[dict], config: dict) -> tuple[int, int]:
     start_date = str(config["analysis_start_date"])
     end_date = str(config["analysis_end_date"])
     scanned_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DATABASE_FILE) as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS comparisons_intervals (
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                product_key TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                gray_state TEXT NOT NULL,
-                green_state TEXT NOT NULL,
-                category TEXT NOT NULL,
-                comparable INTEGER NOT NULL,
-                image_paths TEXT NOT NULL,
-                error_text TEXT NOT NULL,
-                scanned_at TEXT NOT NULL,
-                PRIMARY KEY (start_date, end_date, product_key)
-            )
-        """)
+        _ensure_results_schema(connection)
         connection.execute(
             "DELETE FROM comparisons_intervals WHERE start_date=? AND end_date=?",
             (start_date, end_date),
@@ -795,19 +858,26 @@ def save_results(results: list[dict], config: dict) -> tuple[int, int]:
         for row in results:
             gray_state = "oui" if row["gray_state"] is True else "non" if row["gray_state"] is False else "—"
             green_state = "oui" if row["green_state"] is True else "non" if row["green_state"] is False else "—"
+            peripheral_state = (
+                "oui" if row.get("gray_peripheral_state") is True
+                else "non" if row.get("gray_peripheral_state") is False else "—"
+            )
             connection.execute("""
-                INSERT INTO comparisons_intervals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO comparisons_intervals
+                (start_date, end_date, product_key, display_name, gray_state, green_state,
+                 category, comparable, image_paths, error_text, scanned_at, gray_peripheral_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 start_date, end_date, row["group_key"], row["display_name"],
                 gray_state, green_state, row["category"], int(row["comparable"]),
                 json.dumps(row["image_paths"], ensure_ascii=False),
-                " | ".join(row["errors"]), scanned_at,
+                " | ".join(row["errors"]), scanned_at, peripheral_state,
             ))
     comparable_products = sum(1 for item in results if item["comparable"])
     with_defect = sum(
         1 for item in results
         if item["comparable"] and item["category"] in {
-            "Dossier 1 uniquement", "Présent dans les deux", "Dossier 2 uniquement"
+            "QIA uniquement", "Présent dans QIA et PHEA", "PHEA uniquement"
         }
     )
     return comparable_products, with_defect
@@ -818,13 +888,15 @@ def read_current_results(start_date: str, end_date: str) -> list[tuple]:
         return []
     try:
         with sqlite3.connect(DATABASE_FILE) as connection:
+            _ensure_results_schema(connection)
             return connection.execute("""
-                SELECT display_name, gray_state, green_state, category, comparable, error_text
+                SELECT display_name, gray_state, green_state, category, comparable,
+                       error_text, gray_peripheral_state
                 FROM comparisons_intervals WHERE start_date=? AND end_date=?
                 ORDER BY CASE category
-                    WHEN 'Dossier 1 uniquement' THEN 1
-                    WHEN 'Présent dans les deux' THEN 2
-                    WHEN 'Dossier 2 uniquement' THEN 3
+                    WHEN 'QIA uniquement' THEN 1
+                    WHEN 'Présent dans QIA et PHEA' THEN 2
+                    WHEN 'PHEA uniquement' THEN 3
                     WHEN 'Aucun claquage' THEN 4
                     ELSE 5 END,
                     display_name COLLATE NOCASE
@@ -841,6 +913,7 @@ def read_archive_rows(start_date: str, end_date: str) -> list[tuple]:
         return []
     try:
         with sqlite3.connect(DATABASE_FILE) as connection:
+            _ensure_results_schema(connection)
             return connection.execute("""
                 SELECT display_name, gray_state, green_state, image_paths
                 FROM comparisons_intervals
@@ -854,9 +927,9 @@ def read_archive_rows(start_date: str, end_date: str) -> list[tuple]:
 
 
 ARCHIVE_CATEGORIES = {
-    "Dossier 1 uniquement": "T1_Dossier1_uniquement.zip",
-    "Présent dans les deux": "T2_Present_dans_les_deux.zip",
-    "Dossier 2 uniquement": "T3_Dossier2_uniquement.zip",
+    "QIA uniquement": "T1_QIA_uniquement.zip",
+    "Présent dans QIA et PHEA": "T2_Present_dans_QIA_et_PHEA.zip",
+    "PHEA uniquement": "T3_PHEA_uniquement.zip",
     "À vérifier": "Photos_a_verifier.zip",
 }
 
@@ -865,9 +938,14 @@ def create_category_archives(
     start_date: str,
     end_date: str,
     destination_root: str | Path,
+    min_diameter: float = 1.8,
+    contrast_ratio: float = 0.20,
+    peripheral_zone_percent: float = 2.5,
+    peripheral_area_percent: float = 48.0,
+    peripheral_dark_percent: float = 28.0,
     progress_callback=None,
 ) -> tuple[Path, dict[str, int], list[str]]:
-    """Create one ZIP per comparable defect category, each with gray and green images."""
+    """Create category ZIPs with marked QIA/PHEA images for manual review."""
     rows = read_archive_rows(start_date, end_date)
     categorized: dict[str, list[tuple[str, dict[str, list[str]]]]] = {
         category: [] for category in ARCHIVE_CATEGORIES
@@ -910,15 +988,16 @@ def create_category_archives(
         archive_path = output_directory / archive_name
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             readme = (
-                "Les images disponibles pour les modules à vérifier sont rangées par numéro d emodule. "
+                "Les images disponibles pour les modules à vérifier sont rangées par numéro de module. "
                 "Un module peut ne contenir qu’une seule image si l’autre manque.\n"
                 if category == "À vérifier"
-                else "Chaque dossier module contient les images QIA et PHEA picture_2.\n"
+                else "Chaque dossier module contient les images QIA et PHEA annotées.\n"
             )
             archive.writestr(
                 "Lire.txt",
                 f"Catégorie : {category}\nPériode : {start_date} au {end_date}\n"
-                + readme,
+                + readme
+                + "Cercle jaune : bord du disque ; cercle rouge : claquage détecté ; cercle magenta : point en périphérie.\n",
             )
             for product_name, image_paths in categorized[category]:
                 processed += 1
@@ -927,16 +1006,31 @@ def create_category_archives(
                     for image_text in image_paths[source][:1]:
                         try:
                             image_path = Path(image_text)
-                            entries.append((f"{prefix}_{image_path.name}", image_path.read_bytes()))
-                        except (OSError, ValueError) as exc:
+                            detection = analyze_image(
+                                image_path,
+                                min_diameter,
+                                contrast_ratio,
+                                peripheral_zone_percent,
+                                peripheral_area_percent,
+                                peripheral_dark_percent,
+                                annotate=True,
+                                max_side=MAX_ANALYSIS_SIDE,
+                            )
+                            marked_image = detection.get("annotated")
+                            if marked_image is None:
+                                raise OSError(detection.get("error") or "Image annotée indisponible")
+                            buffer = io.BytesIO()
+                            marked_image.save(buffer, format="PNG")
+                            entries.append((f"{prefix}_{image_path.stem}_annotee.png", buffer.getvalue()))
+                        except Exception as exc:
                             errors.append(
-                                f"{category} | {product_name} | {source} | {_exception_description(exc)}"
+                                f"{category} | {product_name} | {prefix} | {_exception_description(exc)}"
                             )
                 if category != "À vérifier" and len(entries) != 2:
                     continue
                 if not entries:
                     continue
-                product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "numéro_module_inconnu"
+                product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "module_inconnu"
                 for entry_name, image_bytes in entries:
                     archive.writestr(f"{product_folder}/{entry_name}", image_bytes)
                 counts[category] += 1
@@ -960,7 +1054,10 @@ def create_category_archives(
 
 
 class ImageTestWindow:
-    def __init__(self, parent: Tk | Toplevel, paths: tuple[str, ...], min_diameter: float, contrast: float):
+    def __init__(
+        self, parent: Tk | Toplevel, paths: tuple[str, ...], min_diameter: float, contrast: float,
+        peripheral_zone: float, peripheral_area: float, peripheral_dark: float,
+    ):
         self.window = Toplevel(parent)
         self.window.title("Essai de détection")
         self.window.geometry("760x720")
@@ -968,6 +1065,9 @@ class ImageTestWindow:
         self.paths = list(paths)
         self.min_diameter = min_diameter
         self.contrast = contrast
+        self.peripheral_zone = peripheral_zone
+        self.peripheral_area = peripheral_area
+        self.peripheral_dark = peripheral_dark
         self.index = 0
         self.photo = None
 
@@ -989,15 +1089,18 @@ class ImageTestWindow:
             return
         path = self.paths[self.index]
         try:
-            result = analyze_image(path, self.min_diameter, self.contrast)
+            result = analyze_image(
+                path, self.min_diameter, self.contrast,
+                self.peripheral_zone, self.peripheral_area, self.peripheral_dark,
+            )
             label = "CLAQUAGE DÉTECTÉ" if result["detected"] else "AUCUN POINT DÉTECTÉ"
             if result["error"]:
                 label += " — " + result["error"]
             self.summary.configure(text=f"{label}  ({self.index + 1}/{len(self.paths)})")
             edge_spots = sum(1 for spot in result["spots"] if spot["touches_edge"])
             self.details.configure(
-                text=f"{Path(path).name} · {result['mode']} · {len(result['spots'])} point "
-                + (f" dont {edge_spots} en périphérie" if edge_spots else "")
+                text=f"{Path(path).name} · {result['mode']} · {len(result['spots'])} point(s) "
+                + f"· {edge_spots} en périphérie"
             )
             shown = result["annotated"]
             shown.thumbnail((680, 535), Image.Resampling.LANCZOS)
@@ -1022,8 +1125,8 @@ class SettingsWindow:
         self.app = app
         self.window = Toplevel(app.root)
         self.window.title("Paramètres de surveillance")
-        self.window.geometry("780x730")
-        self.window.minsize(700, 640)
+        self.window.geometry("780x770")
+        self.window.minsize(700, 680)
         self.window.transient(app.root)
         self.window.grab_set()
         self.window.protocol("WM_DELETE_WINDOW", self.save_and_close)
@@ -1037,6 +1140,9 @@ class SettingsWindow:
         self.interval = StringVar(value=str(app.config.get("interval_seconds", 30)))
         self.min_diameter = StringVar(value=str(app.config.get("min_spot_diameter_percent", 1.8)))
         self.contrast = StringVar(value=str(app.config.get("contrast_ratio", 0.20)))
+        self.peripheral_zone = StringVar(value=str(app.config.get("peripheral_zone_percent", 2.5)))
+        self.peripheral_area = StringVar(value=str(app.config.get("peripheral_area_percent", 48.0)))
+        self.peripheral_dark = StringVar(value=str(app.config.get("peripheral_dark_percent", 28.0)))
         self.enabled = BooleanVar(value=bool(app.config.get("monitoring_enabled", True)))
         self.save_status_var = StringVar(value="")
 
@@ -1044,21 +1150,21 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Dossier 1 : QIA / Dossier 2 : PHEA. La période filtre la date de création des dossiers QIA et la date du dossier PHEA (format AAAAMMJJ).",
+            text="Dossier 1 = QIA ; dossier 2 = PHEA. La période filtre la date de création des dossiers QIA et la date du dossier PHEA (format AAAAMMJJ).",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
         folders = ttk.LabelFrame(body, text="Dossiers à analyser", padding=10)
         folders.pack(fill="x", pady=5)
-        self._folder_row(folders, "Dossier 1 — images QIA", self.folder_gray, 0)
-        self._folder_row(folders, "Dossier 2 — images PHEA", self.folder_green, 1)
+        self._folder_row(folders, "Dossier 1 — QIA", self.folder_gray, 0)
+        self._folder_row(folders, "Dossier 2 — PHEA", self.folder_green, 1)
 
         results = ttk.LabelFrame(body, text="Export des résultats en archive ZIP", padding=10)
         results.pack(fill="x", pady=5)
         self._folder_row(results, "Dossier de destination", self.results_folder, 0)
         ttk.Label(
             results,
-            text="Le bouton « Archives » créera un sous-dossier daté avec un ZIP par catégorie T1, T2 et T3 (+ a verifier si ok).",
+            text="Le bouton « Créer les archives » crée un sous-dossier daté avec un ZIP par catégorie, plus les photos à vérifier.",
             foreground="#555555",
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
 
@@ -1074,11 +1180,21 @@ class SettingsWindow:
 
         detection = ttk.LabelFrame(body, text="Réglage de détection", padding=10)
         detection.pack(fill="x", pady=5)
-        ttk.Label(detection, text="Diamètre minimal du point (% du diametre du disque)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(detection, text="Diamètre min. (% diamètre disque)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(detection, textvariable=self.min_diameter, width=8).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(detection, text="Contraste minimal (0 à 1)").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(detection, textvariable=self.contrast, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(detection, text="Les points et périphérie sont aussi rechercher", foreground="#555555").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ttk.Label(detection, text="Contraste min. (0 à 1)").grid(row=0, column=2, sticky="w", padx=12, pady=5)
+        ttk.Entry(detection, textvariable=self.contrast, width=8).grid(row=0, column=3, sticky="w", padx=5, pady=5)
+        ttk.Label(detection, text="Zone périphérique (% rayon)").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(detection, textvariable=self.peripheral_zone, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(detection, text="Aire périph. (% seuil standard)").grid(row=1, column=2, sticky="w", padx=12, pady=5)
+        ttk.Entry(detection, textvariable=self.peripheral_area, width=8).grid(row=1, column=3, sticky="w", padx=5, pady=5)
+        ttk.Label(detection, text="Pixels très noirs requis (%)").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(detection, textvariable=self.peripheral_dark, width=8).grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(
+            detection,
+            text="Zone = bord du disque. Des seuils d’aire et de noirceur plus bas détectent davantage de petits points. Une image QIA est périphérique si un point détecté atteint cette zone.",
+            wraplength=710, foreground="#555555",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=12, pady=4)
 
         background = ttk.LabelFrame(body, text="Fonctionnement en arrière-plan", padding=10)
         background.pack(fill="x", pady=5)
@@ -1088,7 +1204,7 @@ class SettingsWindow:
 
         note = ttk.Label(
             body,
-            text="Pour le dossier PHEA, les dossiers date AAAAMMJJ sont filtrés directement sur la période. Pour le dossier QIA, la date de création du dossier module est utilisée",
+            text="Pour PHEA, les dossiers date AAAAMMJJ sont filtrés directement sur la période. Pour QIA, la date de création du dossier module est utilisée.",
             wraplength=730,
         )
         note.pack(anchor="w", pady=10)
@@ -1122,11 +1238,20 @@ class SettingsWindow:
                 raise ValueError("La date de début doit être antérieure ou égale à la date de fin.")
             min_diameter = float(self.min_diameter.get().replace(",", "."))
             contrast = float(self.contrast.get().replace(",", "."))
+            peripheral_zone = float(self.peripheral_zone.get().replace(",", "."))
+            peripheral_area = float(self.peripheral_area.get().replace(",", "."))
+            peripheral_dark = float(self.peripheral_dark.get().replace(",", "."))
             interval = int(self.interval.get())
             if min_diameter <= 0 or min_diameter > 20:
                 raise ValueError("Le diamètre minimal doit être compris entre 0 et 20 %.")
             if contrast <= 0 or contrast >= 1:
                 raise ValueError("Le contraste doit être compris entre 0 et 1.")
+            if peripheral_zone < 0.5 or peripheral_zone > 20:
+                raise ValueError("La zone périphérique doit être comprise entre 0,5 et 20 % du rayon.")
+            if peripheral_area < 10 or peripheral_area > 100:
+                raise ValueError("L’aire minimale en périphérie doit être comprise entre 10 et 100 %.")
+            if peripheral_dark < 10 or peripheral_dark > 80:
+                raise ValueError("Le seuil de pixels très noirs doit être compris entre 10 et 80 %.")
             if not self.pattern.get().strip():
                 raise ValueError("Le motif du nom de fichier ne peut pas être vide.")
         except ValueError as exc:
@@ -1142,6 +1267,9 @@ class SettingsWindow:
             "interval_seconds": interval,
             "min_spot_diameter_percent": min_diameter,
             "contrast_ratio": contrast,
+            "peripheral_zone_percent": peripheral_zone,
+            "peripheral_area_percent": peripheral_area,
+            "peripheral_dark_percent": peripheral_dark,
             "monitoring_enabled": self.enabled.get(),
         }
 
@@ -1195,10 +1323,22 @@ class SettingsWindow:
         try:
             min_diameter = float(self.min_diameter.get().replace(",", "."))
             contrast = float(self.contrast.get().replace(",", "."))
+            peripheral_zone = float(self.peripheral_zone.get().replace(",", "."))
+            peripheral_area = float(self.peripheral_area.get().replace(",", "."))
+            peripheral_dark = float(self.peripheral_dark.get().replace(",", "."))
+            if not 0.5 <= peripheral_zone <= 20:
+                raise ValueError("Zone périphérique hors plage")
+            if not 10 <= peripheral_area <= 100:
+                raise ValueError("Aire périphérique hors plage")
+            if not 10 <= peripheral_dark <= 80:
+                raise ValueError("Seuil de noirceur hors plage")
         except ValueError:
-            messagebox.showerror("Réglage invalide", "Vérifiez le diamètre minimal et le contraste.", parent=self.window)
+            messagebox.showerror("Réglage invalide", "Vérifiez les seuils de détection et de périphérie.", parent=self.window)
             return
-        ImageTestWindow(self.window, paths, min_diameter, contrast)
+        ImageTestWindow(
+            self.window, paths, min_diameter, contrast,
+            peripheral_zone, peripheral_area, peripheral_dark,
+        )
 
 
 class MonitorApp:
@@ -1218,13 +1358,14 @@ class MonitorApp:
         except OSError:
             self.latest_log_path = None
         self.category_names = (
-            "Dossier 1 uniquement",
-            "Présent dans les deux",
-            "Dossier 2 uniquement",
+            "QIA uniquement",
+            "Présent dans QIA et PHEA",
+            "PHEA uniquement",
         )
         self.rate_vars = {name: StringVar(value="— %") for name in self.category_names}
-        self.rate_count_vars = {name: StringVar(value="0 / 0 paire") for name in self.category_names}
+        self.rate_count_vars = {name: StringVar(value="0 / 0 module(s)") for name in self.category_names}
         self.source_summary_var = StringVar(value="Détections individuelles : en attente")
+        self.qia_peripheral_var = StringVar(value="Périphérie QIA : en attente")
         self.count_var = StringVar(value="Paires comparables : en attente")
         self.status_var = StringVar(value="Surveillance arrêtée")
         self.progress_text_var = StringVar(value="Prêt")
@@ -1236,8 +1377,8 @@ class MonitorApp:
 
     def _build_main_window(self) -> None:
         self.root.title("Suivi des modules claqués")
-        self.root.geometry("560x515")
-        self.root.minsize(540, 480)
+        self.root.geometry("600x555")
+        self.root.minsize(560, 510)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1250,9 +1391,9 @@ class MonitorApp:
         cards = ttk.Frame(frame)
         cards.pack(fill="x", pady=(8, 4))
         rate_labels = (
-            ("Dossier 1 seul", self.category_names[0]),
-            ("Dossier 1 + 2", self.category_names[1]),
-            ("Dossier 2 seul", self.category_names[2]),
+            ("QIA seul", self.category_names[0]),
+            ("QIA + PHEA", self.category_names[1]),
+            ("PHEA seul", self.category_names[2]),
         )
         for column, (title, category) in enumerate(rate_labels):
             card = ttk.LabelFrame(cards, text=title, padding=(7, 4))
@@ -1262,10 +1403,11 @@ class MonitorApp:
             ttk.Label(card, textvariable=self.rate_count_vars[category], font=("Segoe UI", 8)).pack()
 
         ttk.Label(frame, textvariable=self.source_summary_var, font=("Segoe UI", 9)).pack(pady=(1, 0))
+        ttk.Label(frame, textvariable=self.qia_peripheral_var, font=("Segoe UI", 9, "bold")).pack(pady=(1, 0))
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
         ttk.Label(
             frame,
-            text="À vérifier = image manquante ou illisible ; photos disponible dans Photos_a_verifier.zip",
+            text="À vérifier = image manquante ou illisible ; les images disponibles sont dans Photos_a_verifier.zip",
             font=("Segoe UI", 8), foreground="#555555",
         ).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))
@@ -1283,17 +1425,17 @@ class MonitorApp:
         self.table.heading("PHEA", text="PHEA")
         self.table.heading("categorie", text="Résultat")
         self.table.column("module", width=140, anchor="w")
-        self.table.column("QIA", width=50, anchor="center")
-        self.table.column("PHEA", width=50, anchor="center")
-        self.table.column("categorie", width=190, anchor="w")
+        self.table.column("QIA", width=120, anchor="center")
+        self.table.column("PHEA", width=70, anchor="center")
+        self.table.column("categorie", width=220, anchor="w")
         self.table.pack(fill="both", expand=True, pady=(3, 8))
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Réouvrir les paramètres", command=self.open_settings).pack(side="left")
         ttk.Button(buttons, text="Analyser", command=self.scan_now).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Export_CSV", command=self.export_csv).pack(side="left")
-        ttk.Button(buttons, text="Sauvegarder", command=self.create_archives).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Exporter CSV", command=self.export_csv).pack(side="left")
+        ttk.Button(buttons, text="Créer les archives", command=self.create_archives).pack(side="left", padx=6)
         ttk.Button(buttons, text="Fichier log", command=self.open_diagnostics).pack(side="left", padx=6)
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
 
@@ -1322,7 +1464,13 @@ class MonitorApp:
     def _write_preflight_log(self, config: dict, message: str) -> None:
         try:
             logger = AnalysisLogger()
-            logger.write("CONFIG | " + json.dumps(config, ensure_ascii=False))
+            logger.write("CONFIG | " + json.dumps({
+                "dossier_QIA": config.get("folder_gray"),
+                "dossier_PHEA": config.get("folder_green"),
+                "dossier_resultats": config.get("results_folder"),
+                "debut": config.get("analysis_start_date"),
+                "fin": config.get("analysis_end_date"),
+            }, ensure_ascii=False))
             logger.write(f"PREFLIGHT_ERROR | {message}")
             self.latest_log_path = logger.path
             logger.close()
@@ -1433,12 +1581,15 @@ class MonitorApp:
                 "CONFIG | " + json.dumps({
                     "analysis_start_date": config.get("analysis_start_date"),
                     "analysis_end_date": config.get("analysis_end_date"),
-                    "folder_gray": config.get("folder_gray"),
-                    "folder_green": config.get("folder_green"),
+                    "dossier_QIA": config.get("folder_gray"),
+                    "dossier_PHEA": config.get("folder_green"),
                     "results_folder": config.get("results_folder"),
                     "filename_pattern": config.get("filename_pattern"),
                     "min_spot_diameter_percent": config.get("min_spot_diameter_percent"),
                     "contrast_ratio": config.get("contrast_ratio"),
+                    "peripheral_zone_percent": config.get("peripheral_zone_percent"),
+                    "peripheral_area_percent": config.get("peripheral_area_percent"),
+                    "peripheral_dark_percent": config.get("peripheral_dark_percent"),
                 }, ensure_ascii=False),
             )
             logger.write(
@@ -1557,7 +1708,7 @@ class MonitorApp:
         self.progress_bar.start(12)
         worker = threading.Thread(
             target=self._archive_worker,
-            args=(start_date, end_date, destination),
+            args=(start_date, end_date, destination, dict(self.config)),
             daemon=True,
         )
         worker.start()
@@ -1573,12 +1724,20 @@ class MonitorApp:
             str(config.get("analysis_end_date", "")),
             float(config.get("min_spot_diameter_percent", 1.8)),
             float(config.get("contrast_ratio", 0.20)),
+            float(config.get("peripheral_zone_percent", 2.5)),
+            float(config.get("peripheral_area_percent", 48.0)),
+            float(config.get("peripheral_dark_percent", 28.0)),
         )
 
-    def _archive_worker(self, start_date: str, end_date: str, destination: str) -> None:
+    def _archive_worker(self, start_date: str, end_date: str, destination: str, config: dict) -> None:
         try:
             output_directory, counts, errors = create_category_archives(
                 start_date, end_date, destination,
+                float(config.get("min_spot_diameter_percent", 1.8)),
+                float(config.get("contrast_ratio", 0.20)),
+                float(config.get("peripheral_zone_percent", 2.5)),
+                float(config.get("peripheral_area_percent", 48.0)),
+                float(config.get("peripheral_dark_percent", 28.0)),
                 progress_callback=self.progress_queue.put,
             )
             self.root.after(
@@ -1665,6 +1824,9 @@ class MonitorApp:
         defects = sum(category_counts.values())
         gray_positive = sum(1 for row in gray_rows if row[1] == "oui")
         green_positive = sum(1 for row in green_rows if row[2] == "oui")
+        qia_peripheral_rows = [row for row in gray_rows if len(row) > 6 and row[6] in {"oui", "non"}]
+        qia_peripheral_positive = sum(1 for row in qia_peripheral_rows if row[1] == "oui" and row[6] == "oui")
+        qia_detected_with_edge_data = sum(1 for row in qia_peripheral_rows if row[1] == "oui")
 
         def source_rate(label: str, positive: int, analyzed: int) -> str:
             if analyzed == 0:
@@ -1677,18 +1839,32 @@ class MonitorApp:
             + "  ·  "
             + source_rate("PHEA", green_positive, len(green_rows))
         )
+        if not qia_peripheral_rows:
+            self.qia_peripheral_var.set("Périphérie QIA : nouvelle analyse nécessaire pour calculer le taux")
+        else:
+            image_rate = 100.0 * qia_peripheral_positive / len(qia_peripheral_rows)
+            spot_rate = (
+                f"{qia_peripheral_positive}/{qia_detected_with_edge_data} détections QIA"
+                f" ({100.0 * qia_peripheral_positive / qia_detected_with_edge_data:.1f} %)"
+                if qia_detected_with_edge_data
+                else "aucune détection QIA"
+            )
+            self.qia_peripheral_var.set(
+                f"Périphérie QIA : {qia_peripheral_positive}/{len(qia_peripheral_rows)} images "
+                f"({image_rate:.1f} %) · {spot_rate}"
+            )
         if pair_count:
             for category in self.category_names:
                 count = category_counts[category]
                 self.rate_vars[category].set(f"{100.0 * count / pair_count:.1f} %")
-                self.rate_count_vars[category].set(f"{count} / {pair_count} paire ")
+                self.rate_count_vars[category].set(f"{count} / {pair_count} module(s)")
             self.count_var.set(
                 f"Paires comparables : {pair_count} · {defects} avec au moins une détection"
             )
         else:
             for category in self.category_names:
                 self.rate_vars[category].set("— %")
-                self.rate_count_vars[category].set("0 / 0 paire")
+                self.rate_count_vars[category].set("0 / 0 module(s)")
             self.count_var.set(
                 f"Aucune paire comparable · {len(gray_rows)} images QIA analysées · "
                 f"{len(green_rows)} PHEA analysées"
@@ -1698,14 +1874,15 @@ class MonitorApp:
             self.table.delete(item)
         tags = {
             "QIA uniquement": "gray_only",
-            "Présent dans les deux": "both",
+            "Présent dans QIA et PHEA": "both",
             "PHEA uniquement": "green_only",
             "À vérifier": "unknown",
         }
         for row, category in classified_rows[:500]:
-            display_name, gray_state, green_state, _stored_category, comparable, error_text = row
+            display_name, gray_state, green_state, _stored_category, comparable, error_text, peripheral_state = row
             tag = tags.get(category, "")
-            self.table.insert("", "end", values=(display_name, gray_state, green_state, category), tags=(tag,) if tag else ())
+            qia_label = "oui · périphérie" if gray_state == "oui" and peripheral_state == "oui" else gray_state
+            self.table.insert("", "end", values=(display_name, qia_label, green_state, category), tags=(tag,) if tag else ())
         self.table.tag_configure("gray_only", foreground="#9a6700")
         self.table.tag_configure("both", foreground="#b42318")
         self.table.tag_configure("green_only", foreground="#0969da")
@@ -1805,23 +1982,45 @@ class MonitorApp:
         destination = filedialog.asksaveasfilename(
             title="Exporter l’historique",
             defaultextension=".csv",
-            initialfile="rapport_claquage.csv",
+            initialfile="rapport_claquage_QIA_PHEA.csv",
             filetypes=(("CSV", "*.csv"),),
         )
         if not destination:
             return
         try:
             with sqlite3.connect(DATABASE_FILE) as connection:
+                _ensure_results_schema(connection)
                 rows = connection.execute("""
-                    SELECT start_date, end_date, display_name, gray_state, green_state,
-                           category, comparable, image_paths, error_text, scanned_at
+                    SELECT start_date, end_date, display_name, gray_state, gray_peripheral_state,
+                           green_state, category, comparable, image_paths, error_text, scanned_at
                     FROM comparisons_intervals ORDER BY start_date DESC, end_date DESC, display_name COLLATE NOCASE
                 """).fetchall()
+            rows = [
+                (
+                    *row[:6],
+                    _classify_states(
+                        {"oui": True, "non": False}.get(row[3]),
+                        {"oui": True, "non": False}.get(row[5]),
+                    ),
+                    *row[7:8],
+                    json.dumps(
+                        {"QIA": json.loads(row[8]).get("gray", []),
+                         "PHEA": json.loads(row[8]).get("green", [])},
+                        ensure_ascii=False,
+                    ),
+                    *row[9:],
+                )
+                for row in rows
+            ]
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
-                writer.writerow(("Début", "Fin", "Numéro modules", "Détecté en QIA", "Détecté en PHEA", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
+                writer.writerow((
+                    "Début", "Fin", "Numéro module", "Détecté en QIA",
+                    "Claquage en périphérie QIA", "Détecté en PHEA", "Catégorie",
+                    "Paire comparable", "Chemins des images (QIA/PHEA)", "Erreur", "Dernière analyse",
+                ))
                 writer.writerows(rows)
-            self.status_var.set("Rapport CSV exportée")
+            self.status_var.set("Rapport CSV exporté")
         except Exception as exc:
             messagebox.showerror("Export fail", str(exc), parent=self.root)
 

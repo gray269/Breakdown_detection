@@ -20,13 +20,13 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 ## Comparaison des deux dossiers
 
-Dans le dossier 1, les sous-dossiers portent les numéros produit. Dans le dossier 2, les sous-dossiers portent les dates (par exemple `20261118`), puis les numéros produit ; le dossier 2 peut aussi être choisi directement sur une date. La période filtre la date de création Windows des dossiers gris et, pour le vert, la date inscrite dans le nom du dossier date. Si le vert ne contient pas de dossier date identifiable, le programme utilise la date de création du dossier produit. Les dossiers gris nommés avec un horodatage après le numéro produit (par exemple `26270014_20261118114306`) sont rattachés au numéro de base `26270014`. Dans chaque dossier produit, un seul fichier image nommé exactement `picture_2` est retenu. Les modules 16 mm et 18 mm sont regroupés.
+Le **dossier 1 correspond à QIA** : ses sous-dossiers portent les numéros de module. Le **dossier 2 correspond à PHEA** : il contient des dossiers datés (par exemple `20261118`), puis les dossiers par numéro de module ; le dossier PHEA peut aussi être choisi directement sur une date. La période filtre la date de création des dossiers QIA et, pour PHEA, la date inscrite dans le nom du dossier date. Si PHEA ne contient pas de dossier date identifiable, le programme utilise la date de création du dossier module. Les dossiers QIA nommés avec un horodatage après le numéro (par exemple `26270014_20261118114306`) sont rattachés au numéro de base `26270014`. Dans chaque dossier module, un seul fichier image nommé exactement `picture_2` est retenu. Les modules 16 mm et 18 mm sont regroupés.
 
-Les deux dossiers sont analysés indépendamment : chaque image `picture_2` trouvée est traitée, quel que soit le résultat de l’autre dossier. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai, afin de garder le même résultat entre l’essai et l’analyse. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les changements de l’algorithme utilisent un nouveau cache versionné et forcent un recalcul une seule fois. Les taux bruts sont calculés séparément : détections grises / images grises analysées et détections vertes / images vertes analysées. Ensuite, les résultats sont rapprochés par numéro produit. T1/T2/T3 ne portent que sur les numéros avec une image analysée dans les deux sources. Une image absente ou illisible n’est jamais considérée comme une absence de claquage.
+QIA et PHEA sont analysés séparément : chaque image `picture_2` trouvée est traitée, quel que soit le résultat de l’autre source. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou un réglage change, elle est recalculée. Les taux QIA et PHEA sont calculés séparément sur les images correctement analysées. Le taux de périphérie QIA affiche à la fois la part des images QIA analysées avec un claquage périphérique et la part de ces détections QIA qui sont périphériques. Une image est dite périphérique si au moins un point accepté entre dans la zone extérieure réglée autour du disque. Une image absente ou illisible n’est jamais considérée comme une absence de claquage.
 
-- **T1 — Dossier 1 uniquement** : claquage détecté en gris, absent en vert.
-- **T2 — Présent dans les deux** : claquage détecté en gris et en vert.
-- **T3 — Dossier 2 uniquement** : claquage absent en gris, détecté en vert.
+- **T1 — QIA uniquement** : claquage détecté en QIA, absent en PHEA.
+- **T2 — Présent dans QIA et PHEA** : claquage détecté dans les deux sources.
+- **T3 — PHEA uniquement** : claquage absent en QIA, détecté en PHEA.
 
 Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa catégorie. « À vérifier » signifie qu’au moins une image nécessaire à la comparaison manque ou n’a pas pu être analysée. Ces lignes restent visibles, mais ne sont classées ni T1, ni T2, ni T3. Les paires sans claquage dans les deux images sont incluses au dénominateur des taux T1/T2/T3, mais ne font partie d’aucune des trois catégories. Si un seul côté est exploitable, son résultat reste visible dans le taux brut de sa source ; le produit n’entre pas dans le dénominateur T1/T2/T3. Les erreurs restent visibles dans le CSV et le journal de diagnostic.
 
@@ -34,19 +34,19 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 
 - Petite fenêtre avec le taux de claquage, le nombre de dossiers analysés et leur résultat.
 - Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre. `Enregistrer` garde la fenêtre ouverte ; `Fermer et enregistrer` et le bouton de fermeture de la fenêtre enregistrent aussi les changements.
-- Surveillance périodique de deux dossiers facultatifs : images en niveaux de gris et images vertes.
+- Surveillance périodique de deux dossiers facultatifs : dossier 1 QIA et dossier 2 PHEA.
 - Barre de progression pendant la recherche et l’analyse des images.
 - Analyse d’un seul fichier `picture_2` par produit dans l’intervalle choisi pour les deux sources.
 - Filtrage des dossiers produit par dates de début et de fin, d’après leur date de création.
 - Cache persistant des détections pour éviter de recalculer les images inchangées lors des scans suivants ou après redémarrage.
 - Détection des points sombres sur le disque lumineux, y compris près de sa périphérie, sans inclure le fond noir extérieur au disque.
-- Réglages de date, fréquence d’analyse, diamètre minimal du point et contraste.
-- Mode essai pour une ou plusieurs images, avec résultat et zone détectée entourée.
+- Réglages manuels de la largeur de la zone périphérique, de l’aire minimale et du niveau de noir requis. Des seuils plus bas rendent la détection périphérique plus sensible.
+- Mode essai pour une ou plusieurs images, avec résultat, contour du disque et points détectés entourés.
 - Export de l’historique en CSV.
 - Bouton `Journal` : affiche et exporte le journal de la dernière analyse, avec les erreurs détaillées et leurs traces techniques.
-- Choix d’un dossier de destination dans les paramètres, puis bouton `Archives` pour créer les résultats ZIP de la période sélectionnée.
+- Choix d’un dossier de destination dans les paramètres, puis bouton `Créer les archives` pour créer les ZIP de la période sélectionnée.
 
-L’export crée un sous-dossier daté dans le dossier de destination, contenant quatre archives : `T1_Dossier1_uniquement.zip`, `T2_Present_dans_les_deux.zip`, `T3_Dossier2_uniquement.zip` et `Photos_a_verifier.zip`. Les archives T1/T2/T3 contiennent un dossier par numéro produit avec les deux fichiers `picture_2`, préfixés `gris_` et `vert_`. `Photos_a_verifier.zip` contient les images disponibles pour les produits où une image manque ou n’a pas pu être analysée ; un dossier produit peut donc contenir une seule image. Les produits sans détection ne sont pas archivés. Le fichier `resume_archivage.txt` indique le nombre de produits par catégorie et les éventuelles images qui n’ont pas pu être copiées.
+L’export crée un sous-dossier daté contenant quatre archives : `T1_QIA_uniquement.zip`, `T2_Present_dans_QIA_et_PHEA.zip`, `T3_PHEA_uniquement.zip` et `Photos_a_verifier.zip`. Les images des archives sont réanalysées avec les réglages choisis et enregistrées en PNG annoté : cercle jaune pour le bord du disque, rouge pour chaque claquage détecté et magenta autour des points périphériques. Chaque sous-dossier porte le numéro du module et contient les images QIA et/ou PHEA disponibles. `Photos_a_verifier.zip` peut contenir une seule image si l’autre manque. Les modules sans détection ne sont pas archivés. Le fichier `resume_archivage.txt` indique le nombre de modules par catégorie et les images qui n’ont pas pu être copiées.
 
 ## Personnaliser les textes de l’interface
 
@@ -63,6 +63,6 @@ Les résultats et les journaux (30 derniers scans) sont enregistrés localement 
 
 ## Règle de calcul
 
-Les taux bruts gris et vert ont chacun leur propre dénominateur, correspondant aux images correctement analysées dans la source. T1, T2 et T3 ont pour dénominateur les paires comparables uniquement. Une image absente ou illisible reste « à vérifier » pour la comparaison ; elle ne transforme pas une détection simple en claquage « uniquement » dans l’autre dossier. Les erreurs sont signalées et visibles dans le CSV. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
+Les taux bruts QIA et PHEA ont chacun leur propre dénominateur, correspondant aux images correctement analysées dans la source. Le taux de périphérie est donné sur les images QIA connues et sur les détections QIA connues. T1, T2 et T3 ont pour dénominateur les paires comparables uniquement. Une image absente ou illisible reste « à vérifier » pour la comparaison. Les erreurs et le statut périphérique QIA apparaissent dans le CSV. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.
