@@ -223,7 +223,7 @@ def analyze_image(
     else:
         signal = (red + green + blue) / 3.0
         bright = signal > 12
-        mode = "image niveaux de gris"
+        mode = "image QIA"
 
     high_percentile = float(np.percentile(signal, 99.5))
     threshold = max(10.0, high_percentile * 0.08)
@@ -561,7 +561,7 @@ def _scan_folders_with_cache(
                 if progress_callback and (folder_index == 1 or folder_index % 50 == 0 or folder_index == folder_total):
                     progress_callback({
                         "phase": "search_progress", "done": folder_index,
-                        "total": folder_total, "source": "gris" if kind == "gray" else "vert",
+                        "total": folder_total, "source": "QIA" if kind == "gray" else "PHEA",
                     })
                 product_name = product_folder.name.strip()
                 if not product_name:
@@ -654,28 +654,28 @@ def _scan_folders_with_cache(
         image_path = groups[key]["gray"]
         if image_path is None:
             continue
-        gray_pass = "gris"
+        gray_pass = "PHEA"
         try:
             detected, _mode, error, cache_hit = detect(image_path, MAX_ANALYSIS_SIDE)
             if error:
                 errors[key].append(f"{image_path.name}: {error}")
                 if logger:
                     logger.write(
-                        f"IMAGE_ERROR | source=gray | produit={groups[key]['product_name']} | "
+                        f"IMAGE_ERROR | source=gray | module={groups[key]['product_name']} | "
                         f"cache={cache_hit} | fichier={image_path} | détail={error}"
                     )
             else:
                 states[key]["gray"] = detected
                 if logger:
                     logger.write(
-                        f"IMAGE_RESULT | source=gray | produit={groups[key]['product_name']} | "
+                        f"IMAGE_RESULT | source=gray | module={groups[key]['product_name']} | "
                         f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
                     )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
             if logger:
                 logger.write_exception(
-                    f"IMAGE_EXCEPTION | source=gray | produit={groups[key]['product_name']} | fichier={image_path} | "
+                    f"IMAGE_EXCEPTION | source=gray | module={groups[key]['product_name']} | fichier={image_path} | "
                     f"détail={_exception_description(exc)}"
                 )
         processed_images += 1
@@ -698,21 +698,21 @@ def _scan_folders_with_cache(
                 errors[key].append(f"{image_path.name}: {error}")
                 if logger:
                     logger.write(
-                        f"IMAGE_ERROR | source=green | produit={groups[key]['product_name']} | "
+                        f"IMAGE_ERROR | source=green | module={groups[key]['product_name']} | "
                         f"cache={cache_hit} | fichier={image_path} | détail={error}"
                     )
             else:
                 states[key]["green"] = detected
                 if logger:
                     logger.write(
-                        f"IMAGE_RESULT | source=green | produit={groups[key]['product_name']} | "
+                        f"IMAGE_RESULT | source=green | module={groups[key]['product_name']} | "
                         f"détecté={'oui' if detected else 'non'} | cache={cache_hit} | fichier={image_path}"
                     )
         except Exception as exc:
             errors[key].append(f"{image_path.name}: {_exception_description(exc)}")
             if logger:
                 logger.write_exception(
-                    f"IMAGE_EXCEPTION | source=green | produit={groups[key]['product_name']} | fichier={image_path} | "
+                    f"IMAGE_EXCEPTION | source=green | module={groups[key]['product_name']} | fichier={image_path} | "
                     f"détail={_exception_description(exc)}"
                 )
         processed_images += 1
@@ -746,9 +746,9 @@ def _scan_folders_with_cache(
     if logger:
         logger.write(
             f"SCAN_SUMMARY | images={total_images} | décodées={decoded_images} | cache={cache_hits} | "
-            f"erreurs={sum(len(item) for item in errors.values())} | produits={len(results)}"
+            f"erreurs={sum(len(item) for item in errors.values())} | module={len(results)}"
         )
-        for kind, label in (("gray", "gris"), ("green", "vert")):
+        for kind, label in (("gray", "QIA"), ("green", "PHEA")):
             found = sum(groups[key][kind] is not None for key in ordered_keys)
             analyzed = sum(states[key][kind] is not None for key in ordered_keys)
             positives = sum(states[key][kind] is True for key in ordered_keys)
@@ -884,7 +884,7 @@ def create_category_archives(
             gray_paths = image_paths.get("gray", [])
             green_paths = image_paths.get("green", [])
             if category != "À vérifier" and (not gray_paths or not green_paths):
-                errors.append(f"{category} | {display_name} | image grise ou verte absente du résultat")
+                errors.append(f"{category} | {display_name} | image QIA ou PHEA absente du résultat")
                 continue
             if category == "À vérifier" and not gray_paths and not green_paths:
                 errors.append(f"{category} | {display_name} | aucun chemin d’image disponible")
@@ -910,20 +910,20 @@ def create_category_archives(
         archive_path = output_directory / archive_name
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             readme = (
-                "Les images disponibles pour les produits à vérifier sont rangées par numéro produit. "
-                "Un produit peut ne contenir qu’une seule image si l’autre manque.\n"
+                "Les images disponibles pour les modules à vérifier sont rangées par numéro d emodule. "
+                "Un module peut ne contenir qu’une seule image si l’autre manque.\n"
                 if category == "À vérifier"
-                else "Chaque dossier produit contient les images grise et verte picture_2.\n"
+                else "Chaque dossier module contient les images QIA et PHEA picture_2.\n"
             )
             archive.writestr(
-                "Lisez-moi.txt",
+                "Lire.txt",
                 f"Catégorie : {category}\nPériode : {start_date} au {end_date}\n"
                 + readme,
             )
             for product_name, image_paths in categorized[category]:
                 processed += 1
                 entries: list[tuple[str, bytes]] = []
-                for source, prefix in (("gray", "gris"), ("green", "vert")):
+                for source, prefix in (("gray", "QIA"), ("green", "PHEA")):
                     for image_text in image_paths[source][:1]:
                         try:
                             image_path = Path(image_text)
@@ -936,7 +936,7 @@ def create_category_archives(
                     continue
                 if not entries:
                     continue
-                product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "produit_inconnu"
+                product_folder = re.sub(r'[<>:"/\\|?*]+', "_", product_name.strip()) or "numéro_module_inconnu"
                 for entry_name, image_bytes in entries:
                     archive.writestr(f"{product_folder}/{entry_name}", image_bytes)
                 counts[category] += 1
@@ -951,7 +951,7 @@ def create_category_archives(
         f"Dossier de résultats : {output_directory}",
         "",
     ]
-    summary_lines.extend(f"{category} : {counts[category]} produit(s)" for category in ARCHIVE_CATEGORIES)
+    summary_lines.extend(f"{category} : {counts[category]} module" for category in ARCHIVE_CATEGORIES)
     summary_lines.extend(["", f"Erreurs de copie : {len(errors)}"])
     if errors:
         summary_lines.extend(errors)
@@ -996,7 +996,7 @@ class ImageTestWindow:
             self.summary.configure(text=f"{label}  ({self.index + 1}/{len(self.paths)})")
             edge_spots = sum(1 for spot in result["spots"] if spot["touches_edge"])
             self.details.configure(
-                text=f"{Path(path).name} · {result['mode']} · {len(result['spots'])} point(s)"
+                text=f"{Path(path).name} · {result['mode']} · {len(result['spots'])} point "
                 + (f" dont {edge_spots} en périphérie" if edge_spots else "")
             )
             shown = result["annotated"]
@@ -1044,21 +1044,21 @@ class SettingsWindow:
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="Dossier 1 : la racine contient les sous-dossiers par numéro produit. Dossier 2 : la racine contient les sous-dossiers par date, puis par numéro produit. La période filtre la date de création des dossiers gris et la date du dossier vert (format AAAAMMJJ). Les dossiers gris suffixés par un horodatage sont associés au numéro produit de base. Seule l’image nommée exactement picture_2 est retenue.",
+            text="Dossier 1 : QIA / Dossier 2 : PHEA. La période filtre la date de création des dossiers QIA et la date du dossier PHEA (format AAAAMMJJ).",
             wraplength=730,
         ).pack(anchor="w", pady=(0, 12))
 
-        folders = ttk.LabelFrame(body, text="Dossiers à surveiller", padding=10)
+        folders = ttk.LabelFrame(body, text="Dossiers à analyser", padding=10)
         folders.pack(fill="x", pady=5)
-        self._folder_row(folders, "Dossier 1 — images grises", self.folder_gray, 0)
-        self._folder_row(folders, "Dossier 2 — images vertes", self.folder_green, 1)
+        self._folder_row(folders, "Dossier 1 — images QIA", self.folder_gray, 0)
+        self._folder_row(folders, "Dossier 2 — images PHEA", self.folder_green, 1)
 
-        results = ttk.LabelFrame(body, text="Export des résultats en archives ZIP", padding=10)
+        results = ttk.LabelFrame(body, text="Export des résultats en archive ZIP", padding=10)
         results.pack(fill="x", pady=5)
         self._folder_row(results, "Dossier de destination", self.results_folder, 0)
         ttk.Label(
             results,
-            text="Le bouton « Archives » créera un sous-dossier daté avec un ZIP par catégorie T1, T2 et T3.",
+            text="Le bouton « Archives » créera un sous-dossier daté avec un ZIP par catégorie T1, T2 et T3 (+ a verifier si ok).",
             foreground="#555555",
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
 
@@ -1074,11 +1074,11 @@ class SettingsWindow:
 
         detection = ttk.LabelFrame(body, text="Réglage de détection", padding=10)
         detection.pack(fill="x", pady=5)
-        ttk.Label(detection, text="Diamètre minimal du point (% du diamètre du disque)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(detection, text="Diamètre minimal du point (% du diametre du disque)").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(detection, textvariable=self.min_diameter, width=8).grid(row=0, column=1, sticky="w", padx=5, pady=5)
         ttk.Label(detection, text="Contraste minimal (0 à 1)").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         ttk.Entry(detection, textvariable=self.contrast, width=8).grid(row=1, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(detection, text="Les points proches du bord sont aussi recherchés.", foreground="#555555").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=4)
+        ttk.Label(detection, text="Les points et périphérie sont aussi rechercher", foreground="#555555").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=4)
 
         background = ttk.LabelFrame(body, text="Fonctionnement en arrière-plan", padding=10)
         background.pack(fill="x", pady=5)
@@ -1088,7 +1088,7 @@ class SettingsWindow:
 
         note = ttk.Label(
             body,
-            text="Pour le dossier vert, les dossiers date AAAAMMJJ sont filtrés directement sur la période. Pour le dossier gris, la date de création du dossier produit est utilisée. Les images passent par la même résolution de détection que le mode essai afin de garder les mêmes résultats. Les détections sont conservées localement et réutilisées si le fichier et les réglages n’ont pas changé. Mode essai : sélectionnez des images pour voir le résultat et la zone détectée.",
+            text="Pour le dossier PHEA, les dossiers date AAAAMMJJ sont filtrés directement sur la période. Pour le dossier QIA, la date de création du dossier module est utilisée",
             wraplength=730,
         )
         note.pack(anchor="w", pady=10)
@@ -1235,7 +1235,7 @@ class MonitorApp:
         self.schedule_next_scan(3)
 
     def _build_main_window(self) -> None:
-        self.root.title("Suivi du claquage")
+        self.root.title("Suivi des modules claqués")
         self.root.geometry("560x515")
         self.root.minsize(540, 480)
         self.root.attributes("-topmost", True)
@@ -1245,7 +1245,7 @@ class MonitorApp:
         frame.pack(fill="both", expand=True)
         header = ttk.Frame(frame)
         header.pack(fill="x")
-        ttk.Label(header, text="COMPARAISON DES CLAQUAGES PAR NUMÉRO PRODUIT", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(header, text="COMPARAISON DES CLAQUAGES PAR NUMÉRO MODULE", font=("Segoe UI", 10, "bold")).pack(anchor="w")
 
         cards = ttk.Frame(frame)
         cards.pack(fill="x", pady=(8, 4))
@@ -1265,7 +1265,7 @@ class MonitorApp:
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
         ttk.Label(
             frame,
-            text="À vérifier = image manquante ou illisible ; photos disponibles dans Photos_a_verifier.zip",
+            text="À vérifier = image manquante ou illisible ; photos disponible dans Photos_a_verifier.zip",
             font=("Segoe UI", 8), foreground="#555555",
         ).pack()
         ttk.Label(frame, textvariable=self.filter_var, foreground="#555555").pack(pady=(2, 4))
@@ -1276,15 +1276,15 @@ class MonitorApp:
         self.progress_bar.pack(side="right", fill="x", expand=True, padx=(8, 0))
         ttk.Label(frame, textvariable=self.status_var, foreground="#555555").pack(pady=(0, 4))
 
-        columns = ("produit", "gris", "vert", "categorie")
+        columns = ("Modules", "QIA", "PHEA", "categorie")
         self.table = ttk.Treeview(frame, columns=columns, show="headings", height=8)
-        self.table.heading("produit", text="Numéro produit")
-        self.table.heading("gris", text="Gris")
-        self.table.heading("vert", text="Vert")
+        self.table.heading("module", text="Numéro module")
+        self.table.heading("QIA", text="QIA")
+        self.table.heading("PHEA", text="PHEA")
         self.table.heading("categorie", text="Résultat")
-        self.table.column("produit", width=140, anchor="w")
-        self.table.column("gris", width=50, anchor="center")
-        self.table.column("vert", width=50, anchor="center")
+        self.table.column("module", width=140, anchor="w")
+        self.table.column("QIA", width=50, anchor="center")
+        self.table.column("PHEA", width=50, anchor="center")
         self.table.column("categorie", width=190, anchor="w")
         self.table.pack(fill="both", expand=True, pady=(3, 8))
 
@@ -1292,9 +1292,9 @@ class MonitorApp:
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Réouvrir les paramètres", command=self.open_settings).pack(side="left")
         ttk.Button(buttons, text="Analyser", command=self.scan_now).pack(side="left", padx=6)
-        ttk.Button(buttons, text="CSV", command=self.export_csv).pack(side="left")
-        ttk.Button(buttons, text="Archives", command=self.create_archives).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Journal", command=self.open_diagnostics).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Export_CSV", command=self.export_csv).pack(side="left")
+        ttk.Button(buttons, text="Sauvegarder", command=self.create_archives).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Fichier log", command=self.open_diagnostics).pack(side="left", padx=6)
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
 
     def set_config(self, config: dict) -> None:
@@ -1338,12 +1338,12 @@ class MonitorApp:
             return
         config = dict(self.config)
         if not config.get("folder_gray") and not config.get("folder_green"):
-            self._write_preflight_log(config, "Aucun dossier gris ou vert n’est configuré.")
+            self._write_preflight_log(config, "Aucun dossier QIA ou PHEA n’est configuré.")
             self.status_var.set("Choisissez au moins un dossier")
             self.open_settings()
             return
         missing = [
-            label for label, folder in (("gris", config.get("folder_gray")), ("vert", config.get("folder_green")))
+            label for label, folder in (("QIA", config.get("folder_gray")), ("PHEA", config.get("folder_green")))
             if folder and not Path(folder).expanduser().is_dir()
         ]
         if missing:
@@ -1450,7 +1450,7 @@ class MonitorApp:
             duration = time.monotonic() - started
             logger.write(
                 f"RUN_FINISHED | résultat_enregistré | durée_secondes={duration:.2f} | "
-                f"produits={len(results)} | paires={total} | détections_dans_paires={defects}"
+                f"module={len(results)} | paires={total} | détections_dans_paires={defects}"
             )
             log_path = logger.path
             self.root.after(0, lambda: self._scan_finished(results, total, defects, duration, "", log_path))
@@ -1493,7 +1493,7 @@ class MonitorApp:
         self.refresh_summary()
         if not results:
             self.progress_text_var.set("Aucun dossier dans l’intervalle")
-            self.status_var.set("Aucun dossier produit créé pendant cette période")
+            self.status_var.set("Aucun dossier module créé pendant cette période")
         else:
             gray_analyzed = sum(row["gray_state"] is not None for row in results)
             green_analyzed = sum(row["green_state"] is not None for row in results)
@@ -1502,11 +1502,11 @@ class MonitorApp:
             green_products = sum(bool(row["image_paths"]["green"]) for row in results)
             errors = [error for row in results for error in row["errors"]]
             self.progress_text_var.set(
-                f"Terminé · gris {gray_analyzed}/{gray_products} · vert {green_analyzed}/{green_products} · paires {pair_count}"
+                f"Terminé · QIA {gray_analyzed}/{gray_products} · PHEA {green_analyzed}/{green_products} · paires {pair_count}"
             )
             if errors:
                 first_error = errors[0][:110]
-                self.status_var.set(f"{len(errors)} erreur(s) · exemple : {first_error} · ouvrir Journal")
+                self.status_var.set(f"{len(errors)} erreur  · exemple : {first_error} · ouvrir Journal")
             elif not gray_analyzed and not green_analyzed:
                 self.status_var.set("Aucune image analysable · vérifier l’accès aux fichiers et les dates")
             else:
@@ -1620,22 +1620,22 @@ class MonitorApp:
             self.latest_log_path = log_path
         if error:
             self.progress_text_var.set("Échec de la création des archives")
-            self.status_var.set("Erreur pendant la création des ZIP · ouvrir Journal")
-            message = error + (f"\n\nJournal : {log_path}" if log_path else "")
+            self.status_var.set("Erreur pendant la création des ZIP · ouvrir Log")
+            message = error + (f"\n\Log : {log_path}" if log_path else "")
             messagebox.showerror("Création des archives impossible", message, parent=self.root)
             return
         total = sum(counts.values())
-        self.progress_text_var.set(f"Archives créées · {total} produit(s)")
+        self.progress_text_var.set(f"Archives créées · {total} Modules")
         if errors:
-            self.status_var.set(f"{len(errors)} copie(s) impossible(s) · détails dans resume_archivage.txt")
+            self.status_var.set(f"{len(errors)} copie impossible  · détails dans resume_archivage.txt")
         else:
             self.status_var.set("Archives créées sans erreur")
         summary = "\n".join(
-            f"{category} : {counts.get(category, 0)} produit(s)"
+            f"{category} : {counts.get(category, 0)} module"
             for category in ARCHIVE_CATEGORIES
         )
         if errors:
-            summary += f"\n\n{len(errors)} image(s) n’ont pas pu être copiées. Voir resume_archivage.txt."
+            summary += f"\n\n{len(errors)} image n’ont pas pu être copiées. Voir resume_archivage.txt."
         messagebox.showinfo(
             "Archives prêtes",
             f"Les archives ont été créées dans :\n{output_directory}\n\n{summary}",
@@ -1673,15 +1673,15 @@ class MonitorApp:
             return f"{label} : {positive}/{analyzed} ({percentage:.1f} %)"
 
         self.source_summary_var.set(
-            source_rate("Gris", gray_positive, len(gray_rows))
+            source_rate("QIA", gray_positive, len(gray_rows))
             + "  ·  "
-            + source_rate("Vert", green_positive, len(green_rows))
+            + source_rate("PHEA", green_positive, len(green_rows))
         )
         if pair_count:
             for category in self.category_names:
                 count = category_counts[category]
                 self.rate_vars[category].set(f"{100.0 * count / pair_count:.1f} %")
-                self.rate_count_vars[category].set(f"{count} / {pair_count} paire(s)")
+                self.rate_count_vars[category].set(f"{count} / {pair_count} paire ")
             self.count_var.set(
                 f"Paires comparables : {pair_count} · {defects} avec au moins une détection"
             )
@@ -1690,16 +1690,16 @@ class MonitorApp:
                 self.rate_vars[category].set("— %")
                 self.rate_count_vars[category].set("0 / 0 paire")
             self.count_var.set(
-                f"Aucune paire comparable · {len(gray_rows)} image(s) grise(s) analysée(s) · "
-                f"{len(green_rows)} verte(s) analysée(s)"
+                f"Aucune paire comparable · {len(gray_rows)} images QIA analysées · "
+                f"{len(green_rows)} PHEA analysées"
             )
         self.filter_var.set(f"{start_date} → {end_date} · toutes tailles de module")
         for item in self.table.get_children():
             self.table.delete(item)
         tags = {
-            "Dossier 1 uniquement": "gray_only",
+            "QIA uniquement": "gray_only",
             "Présent dans les deux": "both",
-            "Dossier 2 uniquement": "green_only",
+            "PHEA uniquement": "green_only",
             "À vérifier": "unknown",
         }
         for row, category in classified_rows[:500]:
@@ -1743,12 +1743,12 @@ class MonitorApp:
 
         ttk.Label(
             window,
-            text="Le journal détaille les dossiers parcourus, les résultats image par image et les erreurs avec leur trace technique.",
+            text="Le journal détaille les dossiers parcourus, les résultats image par image et les erreurs.",
             wraplength=720,
         ).pack(anchor="w", padx=12, pady=(12, 4))
         ttk.Label(
             window,
-            text="Il contient les chemins des dossiers et numéros produit, mais aucune image. Vérifie ces informations avant de le transmettre.",
+            text="Il contient les chemins des dossiers et numéros module, mais aucune image.",
             wraplength=720, foreground="#555555",
         ).pack(anchor="w", padx=12, pady=(0, 8))
 
@@ -1819,11 +1819,11 @@ class MonitorApp:
                 """).fetchall()
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
-                writer.writerow(("Début", "Fin", "Numéro produit", "Détecté en gris", "Détecté en vert", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
+                writer.writerow(("Début", "Fin", "Numéro modules", "Détecté en QIA", "Détecté en PHEA", "Catégorie", "Paire comparable", "Chemins des images", "Erreur", "Dernière analyse"))
                 writer.writerows(rows)
-            self.status_var.set("Rapport CSV exporté")
+            self.status_var.set("Rapport CSV exportée")
         except Exception as exc:
-            messagebox.showerror("Export impossible", str(exc), parent=self.root)
+            messagebox.showerror("Export fail", str(exc), parent=self.root)
 
     def close(self) -> None:
         if self.next_scan_id is not None:
