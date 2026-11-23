@@ -1276,7 +1276,7 @@ class MonitorApp:
         self.progress_bar.pack(side="right", fill="x", expand=True, padx=(8, 0))
         ttk.Label(frame, textvariable=self.status_var, foreground="#555555").pack(pady=(0, 4))
 
-        columns = ("Modules", "QIA", "PHEA", "categorie")
+        columns = ("module", "QIA", "PHEA", "categorie")
         self.table = ttk.Treeview(frame, columns=columns, show="headings", height=8)
         self.table.heading("module", text="Numéro module")
         self.table.heading("QIA", text="QIA")
@@ -1621,7 +1621,7 @@ class MonitorApp:
         if error:
             self.progress_text_var.set("Échec de la création des archives")
             self.status_var.set("Erreur pendant la création des ZIP · ouvrir Log")
-            message = error + (f"\n\Log : {log_path}" if log_path else "")
+            message = error + (f"\nLog : {log_path}" if log_path else "")
             messagebox.showerror("Création des archives impossible", message, parent=self.root)
             return
         total = sum(counts.values())
