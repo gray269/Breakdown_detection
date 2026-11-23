@@ -21,9 +21,13 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
-APP_VERSION = "2026.11.20-archives"
+APP_VERSION = "2026.11.20-cachefix"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
+ANALYSIS_CACHE_VERSION = 2
+# Bump this table suffix whenever the image detection logic changes. Older
+# cached labels were produced before the disk-boundary correction and are stale.
+IMAGE_ANALYSIS_CACHE_TABLE = "image_analysis_cache_v2"
 ANALYSIS_CACHE: dict[tuple, tuple[bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
@@ -236,7 +240,7 @@ def analyze_image(
     cx = float(np.median(xs))
     cy = float(np.median(ys))
     distances = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
-    radius = float(np.percentile(distances, 99.7)) * 1.025
+    radius = float(np.percentile(distances, 99.7)) * 1.005
     if radius < 4:
         return {
             "path": str(path), "detected": False, "mode": mode,
@@ -246,7 +250,11 @@ def analyze_image(
     height, width = signal.shape
     grid_y, grid_x = np.ogrid[:height, :width]
     radial_distance = np.sqrt((grid_x - cx) ** 2 + (grid_y - cy) ** 2)
-    inside = radial_distance <= radius * 1.055
+    # Keep the detection mask inside the illuminated field. A wide margin here
+    # includes the black image background as one huge edge-connected "spot".
+    # The light mask used above excludes real dark spots from the radius fit,
+    # so the small inset still leaves enough of perimeter defects to detect.
+    inside = radial_distance <= radius * 0.995
 
     # A radial median estimates the normal disk brightness at the same distance
     # from the edge. It prevents the dark background around the disk from being
@@ -296,9 +304,18 @@ def analyze_image(
             for y, left, right in component["runs"]
             for x in (left, right)
         )
-        touches_edge = farthest_radius >= radius * 0.965
+        touches_edge = farthest_radius >= radius * 0.975
         needed_area = max(5, int(min_area * (0.48 if touches_edge else 1.0)))
         if component["area"] < needed_area:
+            continue
+        component_width = component["right"] - component["left"] + 1
+        component_height = component["bottom"] - component["top"] + 1
+        aspect_ratio = max(component_width, component_height) / max(1, min(component_width, component_height))
+        fill_ratio = component["area"] / max(1, component_width * component_height)
+        # Reject edge streaks and broad background bands. The target defects
+        # are compact, dark spots; a peripheral spot can be clipped, but should
+        # still fill a reasonable portion of its bounding box.
+        if aspect_ratio > 3.0 or fill_ratio < 0.16:
             continue
         very_dark_count = 0
         contrast_total = 0.0
@@ -425,8 +442,8 @@ def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | 
     contrast_ratio = float(config.get("contrast_ratio", 0.20))
     connection = sqlite3.connect(DATABASE_FILE)
     try:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS image_analysis_cache (
+        connection.execute(f"""
+            CREATE TABLE IF NOT EXISTS {IMAGE_ANALYSIS_CACHE_TABLE} (
                 path TEXT NOT NULL,
                 modified_ns INTEGER NOT NULL,
                 file_size INTEGER NOT NULL,
@@ -439,15 +456,15 @@ def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | 
                 PRIMARY KEY (path, modified_ns, file_size, min_diameter, contrast_ratio, max_side)
             )
         """)
-        rows = connection.execute("""
+        rows = connection.execute(f"""
             SELECT path, modified_ns, file_size, min_diameter, contrast_ratio,
                    max_side, detected, mode, error_text
-            FROM image_analysis_cache
+            FROM {IMAGE_ANALYSIS_CACHE_TABLE}
             WHERE min_diameter=? AND contrast_ratio=?
         """, (min_diameter, contrast_ratio)).fetchall()
         with ANALYSIS_CACHE_LOCK:
             for path, modified_ns, file_size, min_value, contrast_value, max_side, detected, mode, error_text in rows:
-                key = (path, modified_ns, file_size, min_value, contrast_value, max_side)
+                key = (ANALYSIS_CACHE_VERSION, path, modified_ns, file_size, min_value, contrast_value, max_side)
                 ANALYSIS_CACHE[key] = (bool(detected), mode, error_text)
         connection.commit()
         return _scan_folders_with_cache(config, progress_callback, connection, logger)
@@ -599,7 +616,7 @@ def _scan_folders_with_cache(
         stat = image_path.stat()
         resolved_path = str(image_path.resolve())
         cache_key = (
-            resolved_path, stat.st_mtime_ns, stat.st_size,
+            ANALYSIS_CACHE_VERSION, resolved_path, stat.st_mtime_ns, stat.st_size,
             min_diameter, contrast_ratio, max_side,
         )
         with ANALYSIS_CACHE_LOCK:
@@ -615,8 +632,8 @@ def _scan_folders_with_cache(
             # should not decode the same unchanged TIFFs over and over.
             with ANALYSIS_CACHE_LOCK:
                 ANALYSIS_CACHE[cache_key] = cached
-            cache_connection.execute("""
-                INSERT OR REPLACE INTO image_analysis_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cache_connection.execute(f"""
+                INSERT OR REPLACE INTO {IMAGE_ANALYSIS_CACHE_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 resolved_path, stat.st_mtime_ns, stat.st_size,
                 min_diameter, contrast_ratio, max_side,
@@ -993,7 +1010,7 @@ class SettingsWindow:
         self.window.minsize(700, 640)
         self.window.transient(app.root)
         self.window.grab_set()
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window.protocol("WM_DELETE_WINDOW", self.save_and_close)
 
         self.folder_gray = StringVar(value=app.config.get("folder_gray", ""))
         self.folder_green = StringVar(value=app.config.get("folder_green", ""))
@@ -1005,6 +1022,7 @@ class SettingsWindow:
         self.min_diameter = StringVar(value=str(app.config.get("min_spot_diameter_percent", 1.8)))
         self.contrast = StringVar(value=str(app.config.get("contrast_ratio", 0.20)))
         self.enabled = BooleanVar(value=bool(app.config.get("monitoring_enabled", True)))
+        self.save_status_var = StringVar(value="")
 
         body = ttk.Frame(self.window, padding=16)
         body.pack(fill="both", expand=True)
@@ -1062,9 +1080,10 @@ class SettingsWindow:
         actions = ttk.Frame(body)
         actions.pack(fill="x", side="bottom", pady=(10, 0))
         ttk.Button(actions, text="Tester des images…", command=self.test_images).pack(side="left")
+        ttk.Label(actions, textvariable=self.save_status_var).pack(side="left", padx=8)
         ttk.Button(actions, text="Enregistrer", command=self.save).pack(side="right", padx=(6, 0))
         ttk.Button(actions, text="Analyser maintenant", command=self.save_and_scan).pack(side="right", padx=6)
-        ttk.Button(actions, text="Fermer", command=self.close).pack(side="right", padx=6)
+        ttk.Button(actions, text="Fermer et enregistrer", command=self.save_and_close).pack(side="right", padx=6)
 
     @staticmethod
     def _folder_row(parent: ttk.LabelFrame, label: str, variable: StringVar, row: int) -> None:
@@ -1114,11 +1133,20 @@ class SettingsWindow:
         config = self.values()
         if config is None:
             return False
-        self.app.set_config(config)
-        self.close()
+        try:
+            self.app.set_config(config)
+        except Exception as exc:
+            self.save_status_var.set("Échec de l’enregistrement")
+            messagebox.showerror(
+                "Enregistrement impossible",
+                f"Les paramètres n’ont pas été enregistrés.\n\n{_exception_description(exc)}",
+                parent=self.window,
+            )
+            return False
+        self.save_status_var.set(f"Enregistré · {datetime.now():%H:%M:%S}")
         return True
 
-    def close(self) -> None:
+    def _destroy_window(self) -> None:
         try:
             self.window.grab_release()
         except Exception:
@@ -1129,8 +1157,16 @@ class SettingsWindow:
             pass
         self.app.settings_window = None
 
+    def save_and_close(self) -> None:
+        if self.save():
+            self._destroy_window()
+
+    def close(self) -> None:
+        self.save_and_close()
+
     def save_and_scan(self) -> None:
         if self.save():
+            self._destroy_window()
             self.app.scan_now()
 
     def test_images(self) -> None:
@@ -1246,11 +1282,14 @@ class MonitorApp:
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
 
     def set_config(self, config: dict) -> None:
+        analysis_changed = self._analysis_signature(self.config) != self._analysis_signature(config)
         self.config = config
         write_config(config)
         self.refresh_summary()
         self.status_var.set("Paramètres enregistrés")
-        self.schedule_next_scan(2)
+        # Changing only the archive destination must not trigger a costly
+        # image rescan. Analysis settings still refresh promptly in background.
+        self.schedule_next_scan(2 if analysis_changed else None)
 
     def open_settings(self) -> None:
         if self.settings_window:
@@ -1380,10 +1419,14 @@ class MonitorApp:
                     "analysis_end_date": config.get("analysis_end_date"),
                     "folder_gray": config.get("folder_gray"),
                     "folder_green": config.get("folder_green"),
+                    "results_folder": config.get("results_folder"),
                     "filename_pattern": config.get("filename_pattern"),
                     "min_spot_diameter_percent": config.get("min_spot_diameter_percent"),
                     "contrast_ratio": config.get("contrast_ratio"),
                 }, ensure_ascii=False),
+            )
+            logger.write(
+                f"IMAGE_CACHE | version={ANALYSIS_CACHE_VERSION} | table={IMAGE_ANALYSIS_CACHE_TABLE}"
             )
             results = scan_folders(config, progress_callback=self.progress_queue.put, logger=logger)
             total, defects = save_results(results, config)

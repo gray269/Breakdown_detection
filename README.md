@@ -22,7 +22,7 @@ L’artefact est conservé 30 jours. Après expiration, relance **Run workflow**
 
 Dans le dossier 1, les sous-dossiers portent les numéros produit. Dans le dossier 2, les sous-dossiers portent les dates (par exemple `20261118`), puis les numéros produit ; le dossier 2 peut aussi être choisi directement sur une date. La période filtre la date de création Windows des dossiers gris et, pour le vert, la date inscrite dans le nom du dossier date. Si le vert ne contient pas de dossier date identifiable, le programme utilise la date de création du dossier produit. Les dossiers gris nommés avec un horodatage après le numéro produit (par exemple `26270014_20261118114306`) sont rattachés au numéro de base `26270014`. Dans chaque dossier produit, un seul fichier image nommé exactement `picture_2` est retenu. Les modules 16 mm et 18 mm sont regroupés.
 
-Les deux dossiers sont analysés indépendamment : chaque image `picture_2` trouvée est traitée, quel que soit le résultat de l’autre dossier. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai, afin de garder le même résultat entre l’essai et l’analyse. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les taux bruts sont calculés séparément : détections grises / images grises analysées et détections vertes / images vertes analysées. Ensuite, les résultats sont rapprochés par numéro produit. T1/T2/T3 ne portent que sur les numéros avec une image analysée dans les deux sources. Une image absente ou illisible n’est jamais considérée comme une absence de claquage.
+Les deux dossiers sont analysés indépendamment : chaque image `picture_2` trouvée est traitée, quel que soit le résultat de l’autre dossier. Les images sont réduites à une résolution de travail maximale de 640 pixels, identique à celle du mode essai, afin de garder le même résultat entre l’essai et l’analyse. Les détections sont conservées dans la base locale avec le chemin, la date de modification, la taille de fichier et les réglages utilisés. Une nouvelle analyse réutilise les résultats inchangés ; si l’image ou les réglages changent, elle est recalculée. Les changements de l’algorithme utilisent un nouveau cache versionné et forcent un recalcul une seule fois. Les taux bruts sont calculés séparément : détections grises / images grises analysées et détections vertes / images vertes analysées. Ensuite, les résultats sont rapprochés par numéro produit. T1/T2/T3 ne portent que sur les numéros avec une image analysée dans les deux sources. Une image absente ou illisible n’est jamais considérée comme une absence de claquage.
 
 - **T1 — Dossier 1 uniquement** : claquage détecté en gris, absent en vert.
 - **T2 — Présent dans les deux** : claquage détecté en gris et en vert.
@@ -33,13 +33,13 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 ## Fonctions de l’application
 
 - Petite fenêtre avec le taux de claquage, le nombre de dossiers analysés et leur résultat.
-- Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre.
+- Le bouton `Réouvrir les paramètres` permet de rouvrir les réglages après fermeture de leur fenêtre. `Enregistrer` garde la fenêtre ouverte ; `Fermer et enregistrer` et le bouton de fermeture de la fenêtre enregistrent aussi les changements.
 - Surveillance périodique de deux dossiers facultatifs : images en niveaux de gris et images vertes.
 - Barre de progression pendant la recherche et l’analyse des images.
 - Analyse d’un seul fichier `picture_2` par produit dans l’intervalle choisi pour les deux sources.
 - Filtrage des dossiers produit par dates de début et de fin, d’après leur date de création.
 - Cache persistant des détections pour éviter de recalculer les images inchangées lors des scans suivants ou après redémarrage.
-- Détection des points sombres sur le disque lumineux, y compris près de sa périphérie.
+- Détection des points sombres sur le disque lumineux, y compris près de sa périphérie, sans inclure le fond noir extérieur au disque.
 - Réglages de date, fréquence d’analyse, diamètre minimal du point et contraste.
 - Mode essai pour une ou plusieurs images, avec résultat et zone détectée entourée.
 - Export de l’historique en CSV.
