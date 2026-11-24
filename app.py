@@ -22,9 +22,14 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
-APP_VERSION = "2026.11.23-qia-pheaperiphery"
+APP_VERSION = "2026.11.23-qia-index-periphery"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
+FOLDER_INDEX_MAX_AGE_SECONDS = 21600
+FOLDER_INDEX_MIN_REFRESH_SECONDS = 600
+FOLDER_INDEX_BATCH_SIZE = 5000
+ANALYSIS_MEMORY_CACHE_LIMIT = 20000
+FOLDER_INDEX_VERSION = 1
 ANALYSIS_CACHE_VERSION = 3
 # Bump this table suffix whenever the image detection logic changes. Older
 # cached labels were produced before the disk-boundary correction and are stale.
@@ -440,21 +445,262 @@ def _folder_created_date(folder: Path) -> date | None:
         return None
 
 
+def _creation_date_from_stat(stat_result) -> date | None:
+    """Convert a filesystem creation timestamp to a local calendar date."""
+    timestamp = getattr(stat_result, "st_birthtime", None)
+    if timestamp is None:
+        timestamp = stat_result.st_ctime
+    try:
+        return datetime.fromtimestamp(timestamp).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _immediate_directories(folder: Path) -> list[Path]:
+    """List one directory level with scandir, without sorting unrelated entries."""
+    directories: list[Path] = []
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        directories.append(Path(entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return directories
+
+
+def _qia_folder_index(
+    root: Path,
+    start_date: date,
+    end_date: date,
+    connection: sqlite3.Connection,
+    progress_callback=None,
+    logger: AnalysisLogger | None = None,
+) -> tuple[list[tuple[Path, date]], dict[str, int]]:
+    """Use a persistent local index to select QIA folders by creation date."""
+    root_key = os.path.normcase(os.path.abspath(os.fspath(root)))
+    root_stat = root.stat()
+    current_root_mtime = int(root_stat.st_mtime_ns)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS qia_folder_date_index (
+            root_path TEXT NOT NULL,
+            folder_name TEXT NOT NULL COLLATE NOCASE,
+            created_date TEXT,
+            PRIMARY KEY (root_path, folder_name)
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS qia_folder_index_metadata (
+            root_path TEXT PRIMARY KEY,
+            root_mtime_ns INTEGER NOT NULL,
+            indexed_at REAL NOT NULL,
+            folder_count INTEGER NOT NULL,
+            index_version INTEGER NOT NULL
+        )
+    """)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qia_folder_by_date "
+        "ON qia_folder_date_index (root_path, created_date)"
+    )
+    connection.execute("""
+        CREATE TEMP TABLE IF NOT EXISTS qia_folder_date_stage (
+            root_path TEXT NOT NULL,
+            folder_name TEXT NOT NULL COLLATE NOCASE,
+            created_date TEXT,
+            PRIMARY KEY (root_path, folder_name)
+        )
+    """)
+    metadata = connection.execute(
+        "SELECT root_mtime_ns, indexed_at, folder_count, index_version "
+        "FROM qia_folder_index_metadata WHERE root_path=?",
+        (root_key,),
+    ).fetchone()
+    now = time.time()
+    has_index = metadata is not None and metadata[3] == FOLDER_INDEX_VERSION
+    index_age = now - float(metadata[1]) if has_index else float("inf")
+    root_changed = has_index and int(metadata[0]) != current_root_mtime
+    full_refresh = (
+        not has_index
+        or index_age >= FOLDER_INDEX_MAX_AGE_SECONDS
+    )
+    incremental_refresh = (
+        has_index and root_changed and index_age >= FOLDER_INDEX_MIN_REFRESH_SECONDS
+        and not full_refresh
+    )
+    should_refresh = full_refresh or incremental_refresh
+
+    if should_refresh:
+        refresh_mode = "complet" if full_refresh else "incrémental"
+        if logger:
+            reason = "index absent" if not has_index else (
+                "index expiré" if full_refresh and has_index else "racine modifiée"
+            )
+            logger.write(
+                f"QIA_INDEX | actualisation {refresh_mode} | racine={root_key} | raison={reason}"
+            )
+        known_dates: dict[str, str | None] = {}
+        if incremental_refresh:
+            known_dates = {
+                folder_name.casefold(): created_date
+                for folder_name, created_date in connection.execute(
+                    "SELECT folder_name, created_date FROM qia_folder_date_index WHERE root_path=?",
+                    (root_key,),
+                )
+            }
+        connection.execute("DELETE FROM qia_folder_date_stage WHERE root_path=?", (root_key,))
+        connection.commit()
+        batch: list[tuple[str, str, str | None]] = []
+        folder_count = 0
+        stat_failures = 0
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    folder_count += 1
+                    known_date = known_dates.get(entry.name.casefold())
+                    if entry.name.casefold() in known_dates:
+                        created_iso = known_date
+                    else:
+                        try:
+                            created = _creation_date_from_stat(entry.stat())
+                        except OSError:
+                            created = None
+                            stat_failures += 1
+                        created_iso = created.isoformat() if created else None
+                    batch.append((root_key, entry.name, created_iso))
+                    if len(batch) >= FOLDER_INDEX_BATCH_SIZE:
+                        connection.executemany(
+                            "INSERT OR REPLACE INTO qia_folder_date_stage "
+                            "(root_path, folder_name, created_date) VALUES (?, ?, ?)",
+                            batch,
+                        )
+                        connection.commit()
+                        batch.clear()
+                        if progress_callback:
+                            progress_callback({
+                                "phase": "index_progress", "source": "QIA", "done": folder_count,
+                                "mode": refresh_mode,
+                            })
+            if batch:
+                connection.executemany(
+                    "INSERT OR REPLACE INTO qia_folder_date_stage "
+                    "(root_path, folder_name, created_date) VALUES (?, ?, ?)",
+                    batch,
+                )
+                connection.commit()
+            # Keep the old index intact if enumeration failed. A later scan
+            # can retry the refresh while still returning the last good data.
+            indexed_root_mtime = current_root_mtime
+            refresh_completed_at = time.time()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM qia_folder_date_index WHERE root_path=?", (root_key,))
+            connection.execute(
+                "INSERT INTO qia_folder_date_index (root_path, folder_name, created_date) "
+                "SELECT root_path, folder_name, created_date FROM qia_folder_date_stage WHERE root_path=?",
+                (root_key,),
+            )
+            connection.execute("""
+                INSERT INTO qia_folder_index_metadata
+                    (root_path, root_mtime_ns, indexed_at, folder_count, index_version)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(root_path) DO UPDATE SET
+                    root_mtime_ns=excluded.root_mtime_ns,
+                    indexed_at=excluded.indexed_at,
+                    folder_count=excluded.folder_count,
+                    index_version=excluded.index_version
+            """, (root_key, indexed_root_mtime, refresh_completed_at, folder_count, FOLDER_INDEX_VERSION))
+            connection.execute("DELETE FROM qia_folder_date_stage WHERE root_path=?", (root_key,))
+            connection.commit()
+            metadata = (indexed_root_mtime, refresh_completed_at, folder_count, FOLDER_INDEX_VERSION)
+            if logger:
+                logger.write(
+                    f"QIA_INDEX | actualisé={refresh_mode} | dossiers={folder_count} | "
+                    f"erreurs_stat={stat_failures}"
+                )
+        except OSError:
+            connection.rollback()
+            if not has_index:
+                raise
+            if logger:
+                logger.write_exception(
+                    f"QIA_INDEX_ERROR | reconstruction échouée, ancien index conservé | racine={root_key}"
+                )
+            connection.execute("DELETE FROM qia_folder_date_stage WHERE root_path=?", (root_key,))
+            connection.commit()
+    elif root_changed and logger:
+        logger.write(
+            f"QIA_INDEX | réutilisé temporairement | racine modifiée depuis {index_age:.0f} s "
+            f"(actualisation après {FOLDER_INDEX_MIN_REFRESH_SECONDS} s)"
+        )
+    else:
+        if logger:
+            logger.write(
+                f"QIA_INDEX | réutilisé | dossiers={int(metadata[2])} | âge={index_age:.0f} s"
+            )
+
+    if metadata is None:
+        raise OSError(f"Index QIA indisponible pour {root}")
+    totals = connection.execute("""
+        SELECT COUNT(*),
+               SUM(CASE WHEN created_date IS NULL THEN 1 ELSE 0 END),
+               SUM(CASE WHEN created_date BETWEEN ? AND ? THEN 1 ELSE 0 END)
+        FROM qia_folder_date_index WHERE root_path=?
+    """, (start_date.isoformat(), end_date.isoformat(), root_key)).fetchone()
+    total_folders = int(totals[0] or 0)
+    missing_dates = int(totals[1] or 0)
+    in_interval = int(totals[2] or 0)
+    candidates = [
+        (root / folder_name, date.fromisoformat(created_date))
+        for folder_name, created_date in connection.execute("""
+            SELECT folder_name, created_date FROM qia_folder_date_index
+            WHERE root_path=? AND created_date BETWEEN ? AND ?
+        """, (root_key, start_date.isoformat(), end_date.isoformat()))
+        if created_date
+    ]
+    counts = {
+        "folders": total_folders,
+        "in_interval": in_interval,
+        "missing_date": missing_dates,
+        "outside_interval": max(0, total_folders - in_interval - missing_dates),
+    }
+    if progress_callback:
+        progress_callback({
+            "phase": "index_ready", "source": "QIA", "indexed": total_folders,
+            "candidates": in_interval,
+            "mode": refresh_mode if should_refresh else "réutilisé",
+        })
+    return candidates, counts
+
+
 def _picture_2_in(product_folder: Path, pattern: str) -> Path | None:
     """Return one exact picture_2 file from the product folder, without walking deeper."""
     extension_priority = {".tif": 0, ".tiff": 1, ".png": 2, ".jpg": 3, ".jpeg": 4, ".bmp": 5}
+    best: tuple[int, str, Path] | None = None
     try:
-        candidates = [
-            item for item in product_folder.iterdir()
-            if item.is_file()
-            and item.suffix.casefold() in IMAGE_EXTENSIONS
-            and item.stem.strip().casefold() == pattern
-        ]
+        with os.scandir(product_folder) as entries:
+            for entry in entries:
+                stem, suffix = os.path.splitext(entry.name)
+                suffix = suffix.casefold()
+                if suffix not in IMAGE_EXTENSIONS or stem.strip().casefold() != pattern:
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                candidate = (extension_priority.get(suffix, 99), entry.name.casefold(), Path(entry.path))
+                if best is None or candidate[:2] < best[:2]:
+                    best = candidate
     except OSError:
         return None
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: (extension_priority.get(item.suffix.casefold(), 99), item.name.casefold()))
+    return best[2] if best else None
 
 
 def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | None = None) -> list[dict]:
@@ -484,22 +730,6 @@ def scan_folders(config: dict, progress_callback=None, logger: AnalysisLogger | 
                              peripheral_zone, peripheral_area, peripheral_dark, max_side)
             )
         """)
-        rows = connection.execute(f"""
-            SELECT path, modified_ns, file_size, min_diameter, contrast_ratio,
-                   peripheral_zone, peripheral_area, peripheral_dark, max_side,
-                   detected, peripheral_detected, mode, error_text
-            FROM {IMAGE_ANALYSIS_CACHE_TABLE}
-            WHERE min_diameter=? AND contrast_ratio=? AND peripheral_zone=?
-              AND peripheral_area=? AND peripheral_dark=?
-        """, (min_diameter, contrast_ratio, peripheral_zone, peripheral_area, peripheral_dark)).fetchall()
-        with ANALYSIS_CACHE_LOCK:
-            for (path, modified_ns, file_size, min_value, contrast_value, zone_value,
-                 area_value, dark_value, max_side, detected, peripheral_detected, mode, error_text) in rows:
-                key = (
-                    ANALYSIS_CACHE_VERSION, path, modified_ns, file_size, min_value,
-                    contrast_value, zone_value, area_value, dark_value, max_side,
-                )
-                ANALYSIS_CACHE[key] = (bool(detected), bool(peripheral_detected), mode, error_text)
         connection.commit()
         return _scan_folders_with_cache(config, progress_callback, connection, logger)
     finally:
@@ -544,14 +774,17 @@ def _scan_folders_with_cache(
         try:
             if logger:
                 logger.write(f"SOURCE_SEARCH | source={source_label} | racine={root}")
-            top_folders = sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.casefold())
             if kind == "gray":
-                product_folders = [(item, None) for item in top_folders]
+                product_folders, indexed_counts = _qia_folder_index(
+                    root, start_date, end_date, cache_connection, progress_callback, logger,
+                )
+                discovery[kind].update(indexed_counts)
+                folder_total = len(product_folders)
             else:
-                # Green layout can be root/date/product or a selected date
-                # folder/product. Use the YYYYMMDD date-folder name when it is
-                # available; product-folder creation times can change when
-                # data is copied and do not identify the image capture date.
+                # PHEA layout is usually root/date/product. Date children are
+                # read first and excluded before their product folders or
+                # images are inspected.
+                top_folders = _immediate_directories(root)
                 root_date_key = _date_folder_key(root.name)
                 dated_children = [item for item in top_folders if _date_folder_key(item.name)]
                 if root_date_key is not None:
@@ -567,31 +800,20 @@ def _scan_folders_with_cache(
                         if not start_date <= folder_date <= end_date:
                             continue
                         product_folders.extend(
-                            (item, folder_date)
-                            for item in date_folder.iterdir() if item.is_dir()
+                            (item, folder_date) for item in _immediate_directories(date_folder)
                         )
                 else:
-                    # Also handle date-folder labels that are not parseable as
-                    # a numeric date: a date/grouping folder contains product
-                    # directories. In this fallback, product-folder creation
-                    # time is the only available date signal.
+                    # Fallback for date/grouping folders with unrecognized
+                    # names. The product-folder creation date is the only
+                    # available filter in that layout.
                     nested_folders: list[tuple[Path, date | None]] = []
                     for possible_date_folder in top_folders:
                         nested_folders.extend(
-                            (item, None)
-                            for item in possible_date_folder.iterdir() if item.is_dir()
+                            (item, None) for item in _immediate_directories(possible_date_folder)
                         )
-                    product_folders = sorted(
-                        nested_folders or [(item, None) for item in top_folders],
-                        key=lambda item: item[0].name.casefold(),
-                    )
-            product_folders.sort(key=lambda item: (
-                _canonical_product_name(item[0].name).casefold(),
-                item[0].name.casefold() != _canonical_product_name(item[0].name).casefold(),
-                item[0].name.casefold(),
-            ))
-            folder_total = len(product_folders)
-            discovery[kind]["folders"] += folder_total
+                    product_folders = nested_folders or [(item, None) for item in top_folders]
+                folder_total = len(product_folders)
+                discovery[kind]["folders"] += folder_total
             for folder_index, (product_folder, date_from_parent) in enumerate(product_folders, start=1):
                 if progress_callback and (folder_index == 1 or folder_index % 50 == 0 or folder_index == folder_total):
                     progress_callback({
@@ -601,23 +823,35 @@ def _scan_folders_with_cache(
                 product_name = product_folder.name.strip()
                 if not product_name:
                     continue
-                created_on = date_from_parent or _folder_created_date(product_folder)
+                created_on = date_from_parent if date_from_parent is not None else _folder_created_date(product_folder)
                 if created_on is None:
-                    discovery[kind]["missing_date"] += 1
+                    if kind != "gray":
+                        discovery[kind]["missing_date"] += 1
                     continue
                 if not start_date <= created_on <= end_date:
-                    discovery[kind]["outside_interval"] += 1
+                    if kind != "gray":
+                        discovery[kind]["outside_interval"] += 1
                     continue
-                discovery[kind]["in_interval"] += 1
+                if kind != "gray":
+                    discovery[kind]["in_interval"] += 1
                 canonical_name = _canonical_product_name(product_name)
                 product_key = canonical_name.casefold()
                 entry = groups.setdefault(product_key, {
                     "product_name": canonical_name, "gray": None, "green": None,
+                    "source_ranks": {},
                 })
                 image_path = _picture_2_in(product_folder, pattern)
-                if image_path is not None and entry[kind] is None:
-                    entry[kind] = image_path
-                    discovery[kind]["images"] += 1
+                if image_path is not None:
+                    current_rank = entry["source_ranks"].get(kind)
+                    candidate_rank = (
+                        product_name.casefold() != canonical_name.casefold(),
+                        product_name.casefold(),
+                    )
+                    if current_rank is None:
+                        discovery[kind]["images"] += 1
+                    if current_rank is None or candidate_rank < current_rank:
+                        entry[kind] = image_path
+                        entry["source_ranks"][kind] = candidate_rank
         except OSError:
             if logger:
                 logger.write_exception(f"SOURCE_SEARCH_ERROR | source={source_label} | racine={root}")
@@ -659,6 +893,23 @@ def _scan_folders_with_cache(
         )
         with ANALYSIS_CACHE_LOCK:
             cached = ANALYSIS_CACHE.get(cache_key)
+        if cached is None:
+            cached_row = cache_connection.execute(f"""
+                SELECT detected, peripheral_detected, mode, error_text
+                FROM {IMAGE_ANALYSIS_CACHE_TABLE}
+                WHERE path=? AND modified_ns=? AND file_size=?
+                  AND min_diameter=? AND contrast_ratio=? AND peripheral_zone=?
+                  AND peripheral_area=? AND peripheral_dark=? AND max_side=?
+            """, (
+                resolved_path, stat.st_mtime_ns, stat.st_size,
+                min_diameter, contrast_ratio, peripheral_zone, peripheral_area, peripheral_dark, max_side,
+            )).fetchone()
+            if cached_row is not None:
+                cached = (bool(cached_row[0]), bool(cached_row[1]), cached_row[2], cached_row[3])
+                with ANALYSIS_CACHE_LOCK:
+                    if len(ANALYSIS_CACHE) >= ANALYSIS_MEMORY_CACHE_LIMIT:
+                        ANALYSIS_CACHE.clear()
+                    ANALYSIS_CACHE[cache_key] = cached
         cache_hit = cached is not None
         if cached is None:
             decoded_images += 1
@@ -674,6 +925,8 @@ def _scan_folders_with_cache(
             # Keep negative and unusable images cached too; automatic refreshes
             # should not decode the same unchanged TIFFs over and over.
             with ANALYSIS_CACHE_LOCK:
+                if len(ANALYSIS_CACHE) >= ANALYSIS_MEMORY_CACHE_LIMIT:
+                    ANALYSIS_CACHE.clear()
                 ANALYSIS_CACHE[cache_key] = cached
             cache_connection.execute(f"""
                 INSERT OR REPLACE INTO {IMAGE_ANALYSIS_CACHE_TABLE}
@@ -1365,7 +1618,7 @@ class MonitorApp:
         self.rate_vars = {name: StringVar(value="— %") for name in self.category_names}
         self.rate_count_vars = {name: StringVar(value="0 / 0 module(s)") for name in self.category_names}
         self.source_summary_var = StringVar(value="Détections individuelles : en attente")
-        self.qia_peripheral_var = StringVar(value="Périphérie QIA : en attente")
+        self.qia_peripheral_var = StringVar(value="Sous-taux périphérie QIA : en attente")
         self.count_var = StringVar(value="Paires comparables : en attente")
         self.status_var = StringVar(value="Surveillance arrêtée")
         self.progress_text_var = StringVar(value="Prêt")
@@ -1403,7 +1656,10 @@ class MonitorApp:
             ttk.Label(card, textvariable=self.rate_count_vars[category], font=("Segoe UI", 8)).pack()
 
         ttk.Label(frame, textvariable=self.source_summary_var, font=("Segoe UI", 9)).pack(pady=(1, 0))
-        ttk.Label(frame, textvariable=self.qia_peripheral_var, font=("Segoe UI", 9, "bold")).pack(pady=(1, 0))
+        ttk.Label(
+            frame, textvariable=self.qia_peripheral_var, font=("Segoe UI", 9, "bold"),
+            foreground="#7a2e00",
+        ).pack(pady=(1, 0))
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
         ttk.Label(
             frame,
@@ -1530,6 +1786,22 @@ class MonitorApp:
                     self.progress_bar.start(12)
                     self.progress_mode = "indeterminate"
                 self.progress_text_var.set(latest.get("message", "Recherche des images…"))
+            elif phase == "index_progress":
+                if self.progress_mode != "indeterminate":
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="indeterminate")
+                    self.progress_bar.start(12)
+                    self.progress_mode = "indeterminate"
+                self.progress_text_var.set(
+                    f"{latest.get('mode', 'index').capitalize()} QIA · "
+                    f"{int(latest.get('done', 0)):,} dossiers parcourus"
+                )
+            elif phase == "index_ready":
+                self.progress_text_var.set(
+                    f"Index QIA {latest.get('mode', 'prêt')} · "
+                    f"{int(latest.get('indexed', 0)):,} dossiers · "
+                    f"{int(latest.get('candidates', 0)):,} dans la période"
+                )
             elif phase == "search_progress":
                 if self.progress_mode != "determinate":
                     self.progress_bar.stop()
@@ -1840,17 +2112,19 @@ class MonitorApp:
             + source_rate("PHEA", green_positive, len(green_rows))
         )
         if not qia_peripheral_rows:
-            self.qia_peripheral_var.set("Périphérie QIA : nouvelle analyse nécessaire pour calculer le taux")
+            self.qia_peripheral_var.set(
+                "Sous-taux périphérie QIA : non disponible — relancez l’analyse"
+            )
         else:
             image_rate = 100.0 * qia_peripheral_positive / len(qia_peripheral_rows)
             spot_rate = (
-                f"{qia_peripheral_positive}/{qia_detected_with_edge_data} détections QIA"
+                f"{qia_peripheral_positive}/{qia_detected_with_edge_data} détections QIA en périphérie"
                 f" ({100.0 * qia_peripheral_positive / qia_detected_with_edge_data:.1f} %)"
                 if qia_detected_with_edge_data
                 else "aucune détection QIA"
             )
             self.qia_peripheral_var.set(
-                f"Périphérie QIA : {qia_peripheral_positive}/{len(qia_peripheral_rows)} images "
+                f"Sous-taux périphérie QIA : {qia_peripheral_positive}/{len(qia_peripheral_rows)} images "
                 f"({image_rate:.1f} %) · {spot_rate}"
             )
         if pair_count:

@@ -38,6 +38,8 @@ Le tableau affiche le numéro produit, son résultat dans chaque dossier et sa c
 - Barre de progression pendant la recherche et l’analyse des images.
 - Analyse d’un seul fichier `picture_2` par produit dans l’intervalle choisi pour les deux sources.
 - Filtrage des dossiers produit par dates de début et de fin, d’après leur date de création.
+- Index local des dossiers QIA : au premier passage, l’application relève les dates de création des sous-dossiers sans ouvrir leurs images. Ensuite elle interroge cet index pour ne retenir que les dossiers de la période. Si la racine QIA change, l’index est actualisé de façon incrémentale au plus une fois toutes les 10 minutes ; une reconstruction complète de sécurité a lieu après 6 heures. Le premier indexage d’une racine de 160 000 dossiers devra donc encore parcourir une fois les noms et dates de ces dossiers.
+- Barre de progression dédiée au premier indexage et à ses actualisations.
 - Cache persistant des détections pour éviter de recalculer les images inchangées lors des scans suivants ou après redémarrage.
 - Détection des points sombres sur le disque lumineux, y compris près de sa périphérie, sans inclure le fond noir extérieur au disque.
 - Réglages manuels de la largeur de la zone périphérique, de l’aire minimale et du niveau de noir requis. Des seuils plus bas rendent la détection périphérique plus sensible.
@@ -63,6 +65,6 @@ Les résultats et les journaux (30 derniers scans) sont enregistrés localement 
 
 ## Règle de calcul
 
-Les taux bruts QIA et PHEA ont chacun leur propre dénominateur, correspondant aux images correctement analysées dans la source. Le taux de périphérie est donné sur les images QIA connues et sur les détections QIA connues. T1, T2 et T3 ont pour dénominateur les paires comparables uniquement. Une image absente ou illisible reste « à vérifier » pour la comparaison. Les erreurs et le statut périphérique QIA apparaissent dans le CSV. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
+Les taux bruts QIA et PHEA ont chacun leur propre dénominateur, correspondant aux images correctement analysées dans la source. La ligne **Sous-taux périphérie QIA** affiche le nombre et le pourcentage d’images QIA analysées contenant un claquage périphérique, puis le nombre et le pourcentage de détections QIA classées en périphérie. T1, T2 et T3 ont pour dénominateur les paires comparables uniquement. Une image absente ou illisible reste « à vérifier » pour la comparaison. Les erreurs et le statut périphérique QIA apparaissent dans le CSV. Les fichiers nommés `picture_20`, `picture_21`, etc. ne sont pas sélectionnés.
 
 Le seuil doit être vérifié à l’aide du mode essai sur des exemples dont le résultat est connu. Cette première version est un outil de tri et ne remplace pas la validation visuelle.
