@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 APP_NAME = "SuiviClaquage"
-APP_VERSION = "2026.11.23-qia-index-periphery"
+APP_VERSION = "2026.11.24-phea-unpaired-adaptive"
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png", ".bmp"}
 MAX_ANALYSIS_SIDE = 640
 FOLDER_INDEX_MAX_AGE_SECONDS = 21600
@@ -30,10 +30,10 @@ FOLDER_INDEX_MIN_REFRESH_SECONDS = 600
 FOLDER_INDEX_BATCH_SIZE = 5000
 ANALYSIS_MEMORY_CACHE_LIMIT = 20000
 FOLDER_INDEX_VERSION = 1
-ANALYSIS_CACHE_VERSION = 3
+ANALYSIS_CACHE_VERSION = 4
 # Bump this table suffix whenever the image detection logic changes. Older
-# cached labels were produced before the disk-boundary correction and are stale.
-IMAGE_ANALYSIS_CACHE_TABLE = "image_analysis_cache_v3"
+# cached labels were produced before the QIA small-spot correction and are stale.
+IMAGE_ANALYSIS_CACHE_TABLE = "image_analysis_cache_v4"
 ANALYSIS_CACHE: dict[tuple, tuple[bool, bool, str, str]] = {}
 ANALYSIS_CACHE_LOCK = threading.Lock()
 
@@ -323,7 +323,12 @@ def analyze_image(
         touches_edge = farthest_radius >= radius * (1.0 - edge_zone)
         edge_area_factor = min(100.0, max(10.0, float(peripheral_area_percent))) / 100.0
         needed_area = max(5, int(min_area * (edge_area_factor if touches_edge else 1.0)))
-        if component["area"] < needed_area:
+        undersized_qia_candidate = (
+            not is_green
+            and component["area"] < needed_area
+            and component["area"] >= max(8, int(needed_area * 0.45))
+        )
+        if component["area"] < needed_area and not undersized_qia_candidate:
             continue
         component_width = component["right"] - component["left"] + 1
         component_height = component["bottom"] - component["top"] + 1
@@ -343,6 +348,20 @@ def analyze_image(
             contrast_total += float(np.sum(patch_expected - patch_values))
         very_dark_fraction = very_dark_count / component["area"]
         average_contrast = contrast_total / component["area"]
+        if undersized_qia_candidate:
+            # QIA captures can contain compact defects whose measured area is
+            # just below the normal diameter threshold. Admit these only when
+            # their shape and darkness strongly match a real claquage; the
+            # stricter test keeps isolated sensor specks out of the results.
+            max_aspect = 2.8 if touches_edge else 2.2
+            min_fill = 0.40 if touches_edge else 0.55
+            if (
+                aspect_ratio > max_aspect
+                or fill_ratio < min_fill
+                or very_dark_fraction < 0.65
+                or average_contrast < 32
+            ):
+                continue
         edge_dark_fraction = min(80.0, max(10.0, float(peripheral_dark_percent))) / 100.0
         if very_dark_fraction < (edge_dark_fraction if touches_edge else 0.38):
             continue
@@ -1144,7 +1163,7 @@ def read_current_results(start_date: str, end_date: str) -> list[tuple]:
             _ensure_results_schema(connection)
             return connection.execute("""
                 SELECT display_name, gray_state, green_state, category, comparable,
-                       error_text, gray_peripheral_state
+                       error_text, gray_peripheral_state, image_paths
                 FROM comparisons_intervals WHERE start_date=? AND end_date=?
                 ORDER BY CASE category
                     WHEN 'QIA uniquement' THEN 1
@@ -1242,7 +1261,9 @@ def create_category_archives(
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             readme = (
                 "Les images disponibles pour les modules à vérifier sont rangées par numéro de module. "
-                "Un module peut ne contenir qu’une seule image si l’autre manque.\n"
+                "Un module peut ne contenir qu’une seule image si l’autre manque. Une image PHEA sans image QIA "
+                "est analysée et compte dans son taux PHEA, mais reste ici car elle ne peut pas être classée T3 "
+                "sans comparaison QIA.\n"
                 if category == "À vérifier"
                 else "Chaque dossier module contient les images QIA et PHEA annotées.\n"
             )
@@ -1618,7 +1639,8 @@ class MonitorApp:
         self.rate_vars = {name: StringVar(value="— %") for name in self.category_names}
         self.rate_count_vars = {name: StringVar(value="0 / 0 module(s)") for name in self.category_names}
         self.source_summary_var = StringVar(value="Détections individuelles : en attente")
-        self.qia_peripheral_var = StringVar(value="Sous-taux périphérie QIA : en attente")
+        self.phea_unpaired_var = StringVar(value="PHEA sans paire QIA : en attente")
+        self.qia_peripheral_var = StringVar(value="Sous-taux QIA en périphérie : en attente")
         self.count_var = StringVar(value="Paires comparables : en attente")
         self.status_var = StringVar(value="Surveillance arrêtée")
         self.progress_text_var = StringVar(value="Prêt")
@@ -1630,8 +1652,8 @@ class MonitorApp:
 
     def _build_main_window(self) -> None:
         self.root.title("Suivi des modules claqués")
-        self.root.geometry("600x555")
-        self.root.minsize(560, 510)
+        self.root.geometry("600x575")
+        self.root.minsize(560, 530)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1639,14 +1661,20 @@ class MonitorApp:
         frame.pack(fill="both", expand=True)
         header = ttk.Frame(frame)
         header.pack(fill="x")
-        ttk.Label(header, text="COMPARAISON DES CLAQUAGES PAR NUMÉRO MODULE", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(
+            header, text="COMPARAISON DES CLAQUAGES PAR NUMÉRO MODULE",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", anchor="w")
+        ttk.Button(
+            header, text="?", width=3, command=self.show_rate_help,
+        ).pack(side="right", padx=(6, 0))
 
         cards = ttk.Frame(frame)
         cards.pack(fill="x", pady=(8, 4))
         rate_labels = (
-            ("QIA seul", self.category_names[0]),
-            ("QIA + PHEA", self.category_names[1]),
-            ("PHEA seul", self.category_names[2]),
+            ("T1 · QIA seul", self.category_names[0]),
+            ("T2 · QIA + PHEA", self.category_names[1]),
+            ("T3 · PHEA seul", self.category_names[2]),
         )
         for column, (title, category) in enumerate(rate_labels):
             card = ttk.LabelFrame(cards, text=title, padding=(7, 4))
@@ -1657,7 +1685,11 @@ class MonitorApp:
 
         ttk.Label(frame, textvariable=self.source_summary_var, font=("Segoe UI", 9)).pack(pady=(1, 0))
         ttk.Label(
-            frame, textvariable=self.qia_peripheral_var, font=("Segoe UI", 9, "bold"),
+            frame, textvariable=self.phea_unpaired_var, font=("Segoe UI", 9, "bold"),
+            foreground="#315b83",
+        ).pack(pady=(1, 0))
+        ttk.Label(
+            frame, textvariable=self.qia_peripheral_var, font=("Segoe UI", 8, "bold"),
             foreground="#7a2e00",
         ).pack(pady=(1, 0))
         ttk.Label(frame, textvariable=self.count_var, font=("Segoe UI", 9)).pack()
@@ -1694,6 +1726,34 @@ class MonitorApp:
         ttk.Button(buttons, text="Créer les archives", command=self.create_archives).pack(side="left", padx=6)
         ttk.Button(buttons, text="Fichier log", command=self.open_diagnostics).pack(side="left", padx=6)
         ttk.Button(buttons, text="Réduire", command=self.root.iconify).pack(side="right")
+
+    def show_rate_help(self) -> None:
+        messagebox.showinfo(
+            "Comment sont calculés les taux ?",
+            "Taux T1, T2 et T3 (par numéro de module)\n"
+            "Le dénominateur est le nombre de modules avec une image QIA et une image PHEA "
+            "toutes deux analysées avec succès. Chaque module compte une fois, même si plusieurs "
+            "points sont détectés. Les modules sans claquage dans les deux images restent au "
+            "dénominateur.\n\n"
+            "T1 — QIA seul : QIA détecte un claquage et PHEA n’en détecte pas.\n"
+            "T2 — QIA + PHEA : les deux images contiennent au moins un claquage détecté.\n"
+            "T3 — PHEA seul : PHEA détecte un claquage et QIA n’en détecte pas.\n"
+            "Une image manquante ou illisible exclut le module des T1/T2/T3 et le laisse « À vérifier ».\n\n"
+            "Les paires sans détection dans les deux sources restent au dénominateur ; les taux T1/T2/T3 "
+            "peuvent donc totaliser moins de 100 %.\n\n"
+            "Taux bruts QIA et PHEA\n"
+            "Pour chaque source : images où un claquage est détecté / images de cette source "
+            "analysées avec succès.\n\n"
+            "Sous-taux QIA en périphérie\n"
+            "1) Images QIA avec au moins un claquage périphérique / images QIA analysées.\n"
+            "2) Modules QIA avec un claquage périphérique / modules où QIA détecte un claquage.\n"
+            "Un claquage est périphérique si un point détecté entre dans la zone de bord réglée.\n\n"
+            "PHEA sans paire QIA\n"
+            "Images PHEA analysées sans image QIA trouvée pour le même numéro : nombre de détections / "
+            "nombre de ces images analysées. Elles alimentent ce sous-taux PHEA, mais ne sont pas T3 "
+            "car l’absence de claquage QIA n’a pas pu être vérifiée.",
+            parent=self.root,
+        )
 
     def set_config(self, config: dict) -> None:
         analysis_changed = self._analysis_signature(self.config) != self._analysis_signature(config)
@@ -2084,6 +2144,16 @@ class MonitorApp:
             classified_rows.append((row, _classify_states(gray_value, green_value)))
         gray_rows = [row for row in rows if row[1] in {"oui", "non"}]
         green_rows = [row for row in rows if row[2] in {"oui", "non"}]
+        phea_unpaired_rows = []
+        for row in green_rows:
+            try:
+                paths = json.loads(row[7]) if len(row) > 7 and row[7] else {}
+            except (TypeError, json.JSONDecodeError):
+                paths = {}
+            gray_paths = paths.get("gray", []) if isinstance(paths, dict) else []
+            green_paths = paths.get("green", []) if isinstance(paths, dict) else []
+            if not gray_paths and green_paths:
+                phea_unpaired_rows.append(row)
         pair_rows = [row for row in rows if row[1] in {"oui", "non"} and row[2] in {"oui", "non"}]
         pair_count = len(pair_rows)
         category_counts = {
@@ -2111,20 +2181,24 @@ class MonitorApp:
             + "  ·  "
             + source_rate("PHEA", green_positive, len(green_rows))
         )
+        phea_unpaired_positive = sum(1 for row in phea_unpaired_rows if row[2] == "oui")
+        self.phea_unpaired_var.set(
+            source_rate("PHEA sans paire QIA", phea_unpaired_positive, len(phea_unpaired_rows))
+        )
         if not qia_peripheral_rows:
             self.qia_peripheral_var.set(
-                "Sous-taux périphérie QIA : non disponible — relancez l’analyse"
+                "Sous-taux QIA en périphérie : — (aucune image QIA analysée)"
             )
         else:
             image_rate = 100.0 * qia_peripheral_positive / len(qia_peripheral_rows)
             spot_rate = (
-                f"{qia_peripheral_positive}/{qia_detected_with_edge_data} détections QIA en périphérie"
+                f"{qia_peripheral_positive}/{qia_detected_with_edge_data} modules QIA claqués"
                 f" ({100.0 * qia_peripheral_positive / qia_detected_with_edge_data:.1f} %)"
                 if qia_detected_with_edge_data
-                else "aucune détection QIA"
+                else "aucun claquage QIA détecté"
             )
             self.qia_peripheral_var.set(
-                f"Sous-taux périphérie QIA : {qia_peripheral_positive}/{len(qia_peripheral_rows)} images "
+                f"Sous-taux périphérie QIA : {qia_peripheral_positive}/{len(qia_peripheral_rows)} images QIA "
                 f"({image_rate:.1f} %) · {spot_rate}"
             )
         if pair_count:
@@ -2153,7 +2227,7 @@ class MonitorApp:
             "À vérifier": "unknown",
         }
         for row, category in classified_rows[:500]:
-            display_name, gray_state, green_state, _stored_category, comparable, error_text, peripheral_state = row
+            display_name, gray_state, green_state, _stored_category, comparable, error_text, peripheral_state = row[:7]
             tag = tags.get(category, "")
             qia_label = "oui · périphérie" if gray_state == "oui" and peripheral_state == "oui" else gray_state
             self.table.insert("", "end", values=(display_name, qia_label, green_state, category), tags=(tag,) if tag else ())
@@ -2269,31 +2343,36 @@ class MonitorApp:
                            green_state, category, comparable, image_paths, error_text, scanned_at
                     FROM comparisons_intervals ORDER BY start_date DESC, end_date DESC, display_name COLLATE NOCASE
                 """).fetchall()
-            rows = [
-                (
+            export_rows = []
+            for row in rows:
+                image_paths = json.loads(row[8]) if row[8] else {}
+                qia_paths = image_paths.get("gray", [])
+                phea_paths = image_paths.get("green", [])
+                phea_unpaired = (
+                    "oui" if row[5] in {"oui", "non"} and not qia_paths and phea_paths
+                    else "non" if row[5] in {"oui", "non"} and phea_paths
+                    else "—"
+                )
+                export_rows.append((
                     *row[:6],
                     _classify_states(
                         {"oui": True, "non": False}.get(row[3]),
                         {"oui": True, "non": False}.get(row[5]),
                     ),
-                    *row[7:8],
-                    json.dumps(
-                        {"QIA": json.loads(row[8]).get("gray", []),
-                         "PHEA": json.loads(row[8]).get("green", [])},
-                        ensure_ascii=False,
-                    ),
+                    row[7],
+                    phea_unpaired,
+                    json.dumps({"QIA": qia_paths, "PHEA": phea_paths}, ensure_ascii=False),
                     *row[9:],
-                )
-                for row in rows
-            ]
+                ))
             with open(destination, "w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream, delimiter=";")
                 writer.writerow((
                     "Début", "Fin", "Numéro module", "Détecté en QIA",
                     "Claquage en périphérie QIA", "Détecté en PHEA", "Catégorie",
-                    "Paire comparable", "Chemins des images (QIA/PHEA)", "Erreur", "Dernière analyse",
+                    "Paire comparable", "PHEA sans paire QIA",
+                    "Chemins des images (QIA/PHEA)", "Erreur", "Dernière analyse",
                 ))
-                writer.writerows(rows)
+                writer.writerows(export_rows)
             self.status_var.set("Rapport CSV exporté")
         except Exception as exc:
             messagebox.showerror("Export fail", str(exc), parent=self.root)
